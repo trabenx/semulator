@@ -1,0 +1,144 @@
+{
+  "run_settings": {
+    "num_samples": 10,
+    "output_dir": "./output",
+    "master_seed": null, 
+    "verbose": true
+  },
+  "image_settings": {
+    "resolution": [512, 512], 
+    "bit_depth": 16, 
+    "magnification": 1.0, 
+    "oversize_margin_factor": 0.2 
+  },
+  "background": {
+    "types": ["flat", "gradient", "perlin"], 
+    "parameters": {
+      "flat": { "intensity_range": [0.1, 0.3] }, 
+      "gradient": { "type": ["linear", "radial"], "angle_range": [0, 360], "start_intensity_range": [0.1, 0.2], "end_intensity_range": [0.2, 0.4] },
+      "perlin": { "octaves_range": [4, 8], "persistence_range": [0.5, 0.7], "lacunarity_range": [2.0, 2.5], "scale_range": [50.0, 150.0], "contrast_range": [0.1, 0.3] },
+      "composite": {
+          "type1": ["flat", "gradient", "perlin"], 
+          "type2": ["perlin", "gradient"],       
+          "mode": ["additive", "multiplicative", "overlay"], 
+          "alpha_range": [0.3, 0.7] 
+      }
+    },
+    "probability": 1.0 
+  },
+  "layering": {
+    "num_layers_range": [1, 4], 
+    "composition_mode": ["additive", "overwrite"], 
+    "randomize_order": true,
+    "layers": [ 
+      {
+        "layer_id": "circles_grid",
+        "probability": 0.5,
+        "shape": "circle",
+        "pattern": "grid",
+        "intensity_range": [0.5, 0.9],
+        "alpha_range": [0.8, 1.0],
+        "shape_params": {
+          "radius_range": [10, 30] 
+        },
+        "pattern_params": {
+          "rows_range": [3, 8], "cols_range": [3, 8],
+          "spacing_factor_range": [1.5, 3.0], 
+          "jitter_fraction_range": [0.0, 0.1] 
+        }
+      },
+      {
+        "layer_id": "lines_full_span",
+        "probability": 0.3,
+        "shape": "line",
+        "pattern": "full_span_vertical",
+        "intensity_range": [0.4, 0.7],
+        "alpha_range": [0.7, 1.0],
+        "shape_params": {
+          "thickness_range": [2, 5]
+        },
+        "pattern_params": {
+          "count_range": [5, 15],
+          "spacing_jitter_fraction_range": [0.1, 0.3]
+        }
+      },
+      {
+        "layer_id": "rounded_rects_hex",
+        "probability": 0.4,
+        "shape": "rounded_rectangle",
+        "pattern": "hex_grid",
+        "intensity_range": [0.6, 0.9],
+        "shape_params": {
+          "width_range": [20, 40], "height_range": [15, 30], "corner_radius_fraction_range": [0.1, 0.4]
+        },
+        "pattern_params": { "spacing_factor_range": [1.8, 3.5], "jitter_fraction_range": [0.0, 0.15] }
+      },
+       {
+        "layer_id": "polygons_scatter",
+        "probability": 0.2,
+        "shape": "polygon",
+        "pattern": "random_scatter",
+        "intensity_range": [0.5, 0.8],
+        "shape_params": {
+           "radius_range": [15, 35], "num_sides_range": [5, 8], "irregularity_range": [0.0, 0.3]
+        },
+        "pattern_params": { "num_shapes_range": [5, 15] }
+      }
+
+      
+    ]
+  },
+  "artifact_raffle": {
+    "max_effects_per_image": 7, 
+    "categories": {
+      "shape": [
+        { "name": "edge_ripple", "probability": 0.25, "params": {"amplitude_range": [0.5, 2.5], "frequency_factor_range": [5, 20], "noise_factor_range": [0.5, 1.5]} },
+        { "name": "breaks_holes", "probability": 0.15, "params": {"count_range": [1, 4], "size_fraction_range": [0.05, 0.25], "hole_probability": 0.6} },
+        { "name": "local_elastic", "probability": 0.1, "params": {"alpha_range": [5, 20], "sigma_range": [2, 5], "grid_scale": 3}}, 
+        { "name": "contour_smoothing", "probability": 0.2, "params": {"kernel_size_range": [3, 7]} },
+        { "name": "local_brightness", "probability": 0.15, "params": {"contrast_range": [0.05, 0.2], "scale_range": [10, 30]}} 
+        
+      ],
+      "geometric": [
+         { "name": "affine", "probability": 0.4, "params": {"max_scale_delta": 0.1, "max_rotation_deg": 10, "max_shear_deg": 5, "max_translate_fraction": 0.05} },
+         { "name": "elastic", "probability": 0.3, "params": {"alpha_range": [30, 80], "sigma_range": [4, 9], "grid_scale": 4} }
+      ],
+      "instrument": [
+        { "name": "psf_blur", "probability": 0.6, "params": {"sigma_range": [0.5, 1.8], "astigmatism_ratio_range": [1.0, 1.6], "angle_range": [0, 180]} },
+        { "name": "defocus_blur", "probability": 0.2, "params": {"max_radius_range": [1, 4], "gradient_angle_range": [0, 360]}}, 
+        { "name": "charging", "probability": 0.15, "params": {"intensity_range": [0.05, 0.25], "radius_range": [3, 10], "length_factor_range": [5, 30], "threshold_range": [0.7, 0.9]} },
+        { "name": "topographic_shading", "probability": 0.2, "params": {"strength_range": [0.1, 0.5], "light_angle_deg_range": [0, 360], "height_scale_range": [30, 100], "use_layer_height": 0.3 } }, 
+        { "name": "gradient_illumination", "probability": 0.1, "params": {"max_delta_range": [0.1, 0.3], "angle_range": [0, 360]}},
+        { "name": "striping_smearing", "probability": 0.05, "params": {"strength_range": [0.01, 0.05], "direction": ["h", "v"]}}, 
+        { "name": "fixed_pattern_noise", "probability": 0.1, "params": {"scale_range": [50, 150], "strength_range": [0.01, 0.04]} }
+        
+      ],
+      "noise": [
+        { "name": "gaussian", "probability": 0.8, "params": {"sigma_range": [0.01, 0.05]} },
+        { "name": "poisson", "probability": 0.5, "params": {"scale_range": [0.05, 0.2]} }, 
+        { "name": "salt_pepper", "probability": 0.2, "params": {"probability_range": [0.001, 0.01]} },
+        { "name": "sem_texture", "probability": 0.4, "params": {"scale_range": [15, 60], "octaves_range": [3, 7], "contrast_range": [0.03, 0.1], "anisotropy_range":[1.0, 2.0]} }, anisotropy
+        { "name": "quantization", "probability": 0.1, "params": {"target_bits_range": [6, 12]}}, 
+        { "name": "blur_noise", "probability": 0.1, "params": {"sigma_range": [0.5, 1.0]}}
+      ]
+    }
+  },
+  "output_options": {
+    "save_intermediate": true, 
+    "save_masks": true, 
+    "save_visualizations": true, 
+    "save_gifs": true,
+    "save_overlays": true,
+    "save_metadata": true,
+    "save_config": true,
+    "save_warp_field": true,
+    "save_noise_map": true,
+    "save_hashes": false, 
+    "save_defect_masks": true,
+    "save_per_layer_renders": false 
+    "output_formats": { 
+        "final_image": "tif", 
+        "instance_mask": "tif" 
+    }
+  }
+}

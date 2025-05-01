@@ -1,0 +1,10 @@
+numpy
+opencv-python-headless
+imageio[tif,pyav]
+Flask
+scipy
+scikit-image
+Pillow
+perlin-noise
+# Add if needed for specific features, e.g., shapely for complex polygons
+# shapely

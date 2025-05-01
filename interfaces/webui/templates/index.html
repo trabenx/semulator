@@ -1,0 +1,175 @@
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>Synthetic SEM Generator</title>
+        <!-- Add link to style.css -->
+        <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    </head>
+    <body>
+        <h1>Synthetic SEM Image Generator</h1>
+
+        <form id="generate-form">
+            <!-- (Form fields as before - need JS to dynamically populate based on config) -->
+             <div class="form-group">
+                <label for="num_samples">Number of Samples:</label>
+                <input type="number" id="num_samples" name="num_samples" value="10" min="1">
+            </div>
+            <div class="form-group">
+                <label for="master_seed">Master Seed (optional):</label>
+                <input type="number" id="master_seed" name="master_seed" placeholder="Leave blank for random">
+            </div>
+            <button type="submit" id="generate-button">Generate</button>
+        </form>
+
+        <div id="status-area">
+             <h2>Status</h2>
+             <div id="status-message">Status: Idle</div>
+             <div id="progress-container" style="display: none;">
+                  <div id="progress-bar">0%</div>
+             </div>
+             <div id="error-message" style="color: red;"></div>
+             <div id="spinner" class="spinner" style="display: none;"></div>
+        </div>
+
+         <div id="results-area" style="display: none;">
+             <h2>Results (Job <span id="result-job-id"></span>)</h2>
+             <div id="result-message"></div>
+             <ul id="result-list"></ul>
+         </div>
+
+        <script>
+            const form = document.getElementById('generate-form');
+            const generateButton = document.getElementById('generate-button');
+            const statusMessage = document.getElementById('status-message');
+            const progressBar = document.getElementById('progress-bar');
+            const progressContainer = document.getElementById('progress-container');
+            const errorMessage = document.getElementById('error-message');
+            const resultsArea = document.getElementById('results-area');
+            const resultList = document.getElementById('result-list');
+            const resultJobIdSpan = document.getElementById('result-job-id');
+            const resultMessage = document.getElementById('result-message');
+            const spinner = document.getElementById('spinner'); // Assuming you add a spinner element/style
+            let currentJobId = null;
+            let statusInterval = null;
+
+            form.addEventListener('submit', async (event) => {
+                event.preventDefault();
+                generateButton.disabled = true;
+                statusMessage.textContent = 'Status: Starting...';
+                errorMessage.textContent = '';
+                progressBar.style.width = '0%';
+                progressBar.textContent = '0%';
+                progressContainer.style.display = 'block';
+                resultsArea.style.display = 'none';
+                resultList.innerHTML = '';
+                spinner.style.display = 'inline-block'; // Show spinner
+                currentJobId = null;
+                if (statusInterval) clearInterval(statusInterval);
+
+                const formData = new FormData(form);
+                try {
+                    const response = await fetch('/generate', { method: 'POST', body: formData });
+                    const data = await response.json();
+
+                    if (data.status === 'started') {
+                        currentJobId = data.job_id;
+                        statusMessage.textContent = `Status: Queued (Job ID: ${currentJobId})`;
+                        statusInterval = setInterval(checkStatus, 2000);
+                    } else {
+                        handleError(data.message || 'Unknown error starting job');
+                    }
+                } catch (error) {
+                    handleError(`Network or server error: ${error}`);
+                }
+            });
+
+            async function checkStatus() {
+                if (!currentJobId) return;
+
+                try {
+                    const response = await fetch(`/status/${currentJobId}`);
+                    if (!response.ok) {
+                         handleError(`Error fetching status: ${response.statusText}`);
+                         clearInterval(statusInterval); statusInterval = null;
+                         return;
+                    }
+                    const data = await response.json();
+
+                    statusMessage.textContent = `Status: ${data.status} (Job ID: ${currentJobId})`;
+                    progressBar.style.width = `${data.progress}%`;
+                    progressBar.textContent = `${data.progress}%`;
+                    if (data.message) {
+                        statusMessage.textContent += ` - ${data.message}`;
+                    }
+
+                    if (data.status === 'running') {
+                        spinner.style.display = 'inline-block';
+                        progressContainer.style.display = 'block';
+                    } else if (data.status === 'completed') {
+                        clearInterval(statusInterval); statusInterval = null;
+                        spinner.style.display = 'none';
+                        generateButton.disabled = false;
+                        progressContainer.style.display = 'none'; // Hide progress bar on completion
+                        fetchResults(currentJobId, data.message);
+                    } else if (data.status === 'failed') {
+                         clearInterval(statusInterval); statusInterval = null;
+                         handleError(`Job failed: ${data.error || 'Unknown reason'}`);
+                    } else if (data.status === 'queued') {
+                        spinner.style.display = 'inline-block';
+                    }
+                } catch (error) {
+                     handleError(`Error checking status: ${error}`);
+                     clearInterval(statusInterval); statusInterval = null;
+                }
+            }
+
+             async function fetchResults(jobId, finalMessage) {
+                 resultsArea.style.display = 'block';
+                 resultJobIdSpan.textContent = jobId;
+                 resultMessage.textContent = finalMessage || "Fetching results list...";
+                 try {
+                     const response = await fetch(`/results/${jobId}`);
+                      if (!response.ok) {
+                           resultMessage.textContent = `Error fetching results: ${response.statusText}`;
+                           return;
+                      }
+                     const data = await response.json();
+                     if (data.files && data.files.length > 0) {
+                         resultList.innerHTML = ''; // Clear placeholder
+                         data.files.forEach(file => {
+                              const li = document.createElement('li');
+                              const a = document.createElement('a');
+                              a.href = file.url;
+                              a.textContent = file.name;
+                              if (file.name.endsWith('.zip') || !file.name.includes('/')) {
+                                   a.target = '_blank'; // Open downloads/ZIP in new tab
+                              } else {
+                                   // Add JS to fetch/display subdir contents? Or just link? Link for now.
+                                   // a.onclick = (e) => { e.preventDefault(); fetchSubdir(file.url); };
+                              }
+                              li.appendChild(a);
+                              resultList.appendChild(li);
+                         });
+                      } else {
+                          resultList.innerHTML = '<li>No result files found.</li>';
+                      }
+                      resultMessage.textContent = finalMessage || "Job completed."; // Update message
+                 } catch (error) {
+                     resultMessage.textContent = `Error fetching results: ${error}`;
+                 }
+            }
+
+            function handleError(message) {
+                errorMessage.textContent = message;
+                statusMessage.textContent = 'Status: Error';
+                spinner.style.display = 'none';
+                progressContainer.style.display = 'none';
+                generateButton.disabled = false;
+                if (statusInterval) clearInterval(statusInterval);
+                statusInterval = null;
+            }
+
+        </script>
+    </body>
+    </html>
