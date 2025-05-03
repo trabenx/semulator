@@ -1,6 +1,6 @@
 import numpy as np
 import cv2
-from ..core.utils import get_kernel
+from src.core.utils import get_kernel
 from scipy.ndimage import convolve1d
 
 def apply_psf_blur(image, params, rng):

@@ -2,13 +2,20 @@
 import sys
 import argparse
 from pathlib import Path
+import os
 
 # Add src directory to Python path if needed (e.g., when running main.py directly)
 project_root = Path(__file__).resolve().parent
 src_path = project_root / 'src'
+interfaces_path = project_root / 'interfaces'
+
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+    print(f"DEBUG: Added project root to sys.path: {project_root}") # Debug print
+
 if str(src_path) not in sys.path:
     sys.path.insert(0, str(src_path))
-interfaces_path = project_root / 'interfaces'
+
 if str(interfaces_path) not in sys.path:
      sys.path.insert(0, str(interfaces_path)) # Ensure interfaces package is importable
 
@@ -30,6 +37,7 @@ if __name__ == "__main__":
     args, remaining_argv = parser.parse_known_args()
 
     # Pass remaining arguments to the specific interface runner
+    script_path = os.path.abspath(sys.argv[0])
     sys.argv = [sys.argv[0]] + remaining_argv # Update sys.argv for the sub-parser
 
     if args.mode == 'cli':

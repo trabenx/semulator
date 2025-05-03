@@ -3,6 +3,7 @@ import cv2
 import os
 import time
 import logging
+import imageio
 from pathlib import Path
 
 from .utils import get_rng, ensure_dir, normalize_image, image_to_bit_depth, get_distinct_colors
@@ -11,9 +12,6 @@ from ..components.raffler import Raffler
 from ..components.background import generate_background
 from ..components.patterns import get_pattern_positions
 from ..components.shapes import create_shape_mask, render_shape, draw_shape
-from ..components.artifacts import (apply_edge_ripple, apply_breaks_holes, # Shape artifacts
-                                   apply_affine, apply_elastic, # Geometric
-                                   apply_psf_blur, apply_charging) # Instrument
 from ..components.noise import apply_noise
 from ..outputs.writers import (save_numpy, save_image_data, save_json_data,
                              save_gif_data, save_text_file, calculate_hashes)
@@ -85,12 +83,26 @@ def generate_sample(sample_idx, base_config, master_rng, output_parent_dir):
     config = randomize_config_for_sample(base_config, sample_seed)
     logger.info(f"--- Generating Sample {sample_idx:05d} (Seed: {sample_seed}) ---")
 
-    h, w = config['image_settings']['resolution']
-    bit_depth = config['image_settings']['bit_depth']
-    # Randomize magnification per sample if range provided
-    magnification = config['image_settings'].get('magnification', # Use direct value if no range
-                                                  config['image_settings'].get('magnification_range', 1.0)) # Use range if present, fallback 1.0
-    pixel_size_nm = config['image_settings']['pixel_size_nm_at_1x'] / magnification
+    # --- Safely get image settings ---
+    image_settings = config.get('image_settings', {}) # Get the sub-dict safely
+
+    h, w = image_settings.get('resolution', [256, 256]) # Default if missing
+    bit_depth = image_settings.get('bit_depth', 16) # Default if missing
+
+        # Get magnification (already randomized if range was present)
+    magnification = image_settings.get('magnification', 1.0) # Default if missing
+
+    # Get pixel size, providing a default value if missing
+    pixel_size_nm_at_1x = image_settings.get('pixel_size_nm_at_1x', None) # Get safely
+    if pixel_size_nm_at_1x is None:
+        logger.warning("'pixel_size_nm_at_1x' not found in image_settings. Scale bar calculation will be skipped or use default.")
+        pixel_size_nm = None # Indicate that pixel size is unknown
+    elif magnification == 0: # Avoid division by zero
+         logger.warning("Magnification is zero, cannot calculate pixel size. Scale bar may be incorrect.")
+         pixel_size_nm = None
+    else:
+        pixel_size_nm = pixel_size_nm_at_1x / magnification
+        logger.debug(f"Calculated pixel size: {pixel_size_nm:.3f} nm")
 
     out_opts = config['output_options']
     sample_name = f"sem_{sample_idx:05d}"
@@ -422,7 +434,9 @@ def generate_sample(sample_idx, base_config, master_rng, output_parent_dir):
     metadata = {
         "sample_index": sample_idx, "sample_name": sample_name, "seed": sample_seed,
         "resolution": config['image_settings']['resolution'],
-        "magnification": magnification, "pixel_size_nm": pixel_size_nm,
+        "magnification": magnification,
+        "pixel_size_nm_at_1x": pixel_size_nm_at_1x, # Store the base value used
+        "pixel_size_nm_calculated": pixel_size_nm, # Store the calculated value (could be None)
         "background_type": config.get('background',{}).get('selected_type'),
         "layers": [{'config_idx': idx, 'layer_id': data['id']} for idx, data in all_layers_data.items()],
         "num_layers": len(selected_layers), "composition_mode": composition_mode,
@@ -503,25 +517,44 @@ def generate_sample(sample_idx, base_config, master_rng, output_parent_dir):
                  output_paths['combined_actual_mask_vis'] = str(path_vis.relative_to(output_parent_dir))
 
         # Instance Mask (Post-Warp)
-        if instance_mask is not None:
-             inst_mask_format = out_opts.get('output_formats', {}).get('instance_mask', 'tif')
-             inst_mask_bit_depth = 16 if instance_mask.dtype == np.uint16 else 32 # Or just save as npy? Save as TIF.
-             path = sample_output_dir / f"instance_mask.{inst_mask_format}"
-             # imageio might handle uint32 TIF, needs checking. Use numpy if fails.
-             try:
-                  # Instance mask is not normalized, save directly
-                  imageio.imwrite(path, instance_mask, format='TIFF-FI')
-             except Exception as e:
-                  logger.warning(f"Failed to save instance mask as {inst_mask_format} ({e}). Saving as NPY.")
-                  path = sample_output_dir / "instance_mask.npy"
-                  save_numpy(instance_mask, path)
+        if instance_mask is not None and out_opts['save_masks']: # Check save_masks flag
+            inst_mask_format = out_opts.get('output_formats', {}).get('instance_mask', 'tif').lower()
+            path = sample_output_dir / f"instance_mask.{inst_mask_format}"
+            saved_successfully = False
+            try:
+                if inst_mask_format == 'tif' or inst_mask_format == 'tiff':
+                    # No normalization needed for instance masks
+                    save_image_data(instance_mask, path, bit_depth=32 if instance_mask.dtype==np.uint32 else 16, format_hint='TIFF')
+                    saved_successfully = path.is_file() # Check if file was actually created
+                elif inst_mask_format == 'png':
+                    # PNG usually needs 8 or 16 bit, might lose instance IDs if > 65535
+                    if np.max(instance_mask) > 65535:
+                        logger.warning("Max instance ID > 65535, saving as 16-bit PNG might lose IDs. Consider TIF or NPY.")
+                        img_to_save = instance_mask.astype(np.uint16)
+                    else:
+                        img_to_save = instance_mask.astype(np.uint16 if np.max(instance_mask)>255 else np.uint8)
+                    save_image_data(img_to_save, path, bit_depth=16 if img_to_save.dtype==np.uint16 else 8, format_hint='PNG')
+                    saved_successfully = path.is_file()
+                else:
+                    logger.warning(f"Unsupported instance mask format '{inst_mask_format}'. Saving as NPY.")
 
-             output_paths['instance_mask'] = str(path.relative_to(output_parent_dir))
-             if out_opts['save_visualizations'] and instance_mask_vis is not None:
-                  path_vis = sample_output_dir / "instance_mask_vis.png"
-                  # instance_mask_vis is already BGR uint8
-                  imageio.imwrite(path_vis, instance_mask_vis, format='PNG')
-                  output_paths['instance_mask_vis'] = str(path_vis.relative_to(output_parent_dir))
+            except Exception as e:
+                logger.error(f"Error saving instance mask as {inst_mask_format}: {e}", exc_info=True)
+
+            # Fallback to NPY if specified format failed or wasn't image format
+            if not saved_successfully:
+                logger.warning(f"Failed to save instance mask as {inst_mask_format}. Saving as NPY.")
+                path = sample_output_dir / "instance_mask.npy"
+                save_numpy(instance_mask, path)
+
+            # Add the final path (either image format or npy)
+            add_path('instance_mask', path)
+
+            # Save visualization (if needed)
+            if out_opts['save_visualizations'] and instance_mask_vis is not None:
+                path_vis = sample_output_dir / "instance_mask_vis.png"
+                save_image_data(instance_mask_vis, path_vis, 8, format_hint='PNG') # Vis is usually uint8 BGR
+                add_path('instance_mask_vis', path_vis)
 
 
     if out_opts['save_masks'] and out_opts.get('save_defect_masks'):

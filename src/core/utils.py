@@ -73,14 +73,25 @@ def scale_coords(coords, scale_factor):
 # --- Add more utils as needed: color mapping, overlay drawing ---
 def get_distinct_colors(n):
     """Generates N visually distinct colors."""
-    # Simple approach, can be improved
+    # Simple approach, cycles through hues
     colors = []
     for i in range(n):
-        hue = i * (360.0 / n)
-        hsv_color = np.uint8([[[hue, 255, 255]]])
+        # PROBLEM: Hue calculation can exceed 180 for large 'n' or certain 'i' values
+        # OpenCV HSV hue range is typically 0-179 for uint8 representation
+        hue = i * (360.0 / n) # This calculates hue in degrees (0-360)
+
+        # --- Fix Here ---
+        # Convert hue to OpenCV's 0-179 range for uint8 HSV
+        opencv_hue = int(round((hue / 360.0) * 180.0)) % 180 # Modulo 180 ensures wrap-around
+
+        # Create HSV color (ensure S and V are within uint8 range 0-255)
+        # Using 255 for S and V gives bright, saturated colors
+        hsv_color = np.uint8([[[opencv_hue, 255, 255]]]) # <-- Use opencv_hue
+
         bgr_color = cv2.cvtColor(hsv_color, cv2.COLOR_HSV2BGR)[0][0]
-        colors.append(tuple(map(int, bgr_color)))
+        colors.append(tuple(map(int, bgr_color))) # Convert numpy array elements to standard ints for tuples
     return colors
+
 
 def create_color_visualization(mask, colormap):
     """Creates a colored visualization from an ID mask."""

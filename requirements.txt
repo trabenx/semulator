@@ -6,5 +6,7 @@ scipy
 scikit-image
 Pillow
 perlin-noise
+tifffile
+imagecodecs
 # Add if needed for specific features, e.g., shapely for complex polygons
 # shapely
