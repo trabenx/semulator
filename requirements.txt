@@ -8,5 +8,6 @@ Pillow
 perlin-noise
 tifffile
 imagecodecs
+tqdm
 # Add if needed for specific features, e.g., shapely for complex polygons
 # shapely

@@ -1,7 +1,7 @@
 import numpy as np
 import cv2
 from src.core.utils import get_kernel
-from scipy.ndimage import convolve1d
+from scipy.ndimage import convolve1d, binary_erosion, gaussian_filter
 
 def apply_psf_blur(image, params, rng):
     """Applies simulated probe PSF blur (Gaussian/elliptical)."""
@@ -29,6 +29,7 @@ def apply_psf_blur(image, params, rng):
 
     print(f"Applied PSF blur: sigma={sigma:.2f}, ratio={astigmatism_ratio:.2f}, angle={angle:.1f}")
     return blurred # filter2D preserves float type
+
 
 def apply_defocus_blur(image, params, rng):
     """Applies spatially varying defocus blur."""
@@ -115,9 +116,17 @@ def apply_charging(image, params, rng):
     kernel_erode = cv2.getStructuringElement(cv2.MORPH_RECT,(3,3))
     charge_sites_mask = binary_erosion(charge_sites_mask, structure=kernel_erode)
     charge_sites_mask = charge_sites_mask.astype(np.float32) # Convert to float for filtering
+    
+    # Optional: Erode slightly (Now binary_erosion is available)
+    if np.sum(charge_sites_mask) > 0: # Only erode if there are sites
+        kernel_erode = cv2.getStructuringElement(cv2.MORPH_RECT,(3,3))
+        # Ensure input to binary_erosion is boolean
+        charge_sites_mask = binary_erosion(charge_sites_mask, structure=kernel_erode)
+        charge_sites_mask = charge_sites_mask.astype(np.float32) # Convert back for filtering
+    else: # No sites detected, convert empty mask to float
+        charge_sites_mask = charge_sites_mask.astype(np.float32)
 
     if np.sum(charge_sites_mask) < 1: # No charging sites detected
-        print("No charging sites detected.")
         return output_image
 
     # --- 2. Simulate charge accumulation bloom/glow ---
@@ -125,7 +134,8 @@ def apply_charging(image, params, rng):
     glow_ksize = radius * 2 + 1
     charge_glow = cv2.GaussianBlur(charge_sites_mask, (glow_ksize, glow_ksize), radius)
     # Scale glow intensity
-    charge_glow = charge_glow / (np.max(charge_glow) + 1e-6) # Normalize roughly 0-1
+    if np.max(charge_glow) > 1e-6: # Avoid division by zero if glow is all zeros
+        charge_glow = charge_glow / np.max(charge_glow)
     # Add glow to the image
     output_image += charge_glow * intensity_factor * 0.7 # Glow is additive
 
@@ -153,9 +163,17 @@ def apply_charging(image, params, rng):
              kernel_motion[line_points[:, 1], line_points[:, 0]] = 1.0
              kernel_motion /= np.sum(kernel_motion) # Normalize
 
-             # Apply directional blur to the charge *sites* mask (not the glow)
-             streaks = cv2.filter2D(charge_sites_mask, -1, kernel_motion)
-             streaks = streaks / (np.max(streaks) + 1e-6) # Normalize approx 0-1
+             if np.sum(kernel_motion) > 1e-6:
+                 kernel_motion /= np.sum(kernel_motion) # Normalize
+             else:
+                 kernel_motion = None # Avoid using zero kernel
+
+
+             if kernel_motion is not None:
+                 # Apply directional blur to the charge *sites* mask (not the glow)
+                 streaks = cv2.filter2D(charge_sites_mask, -1, kernel_motion)
+                 if np.max(streaks) > 1e-6:
+                     streaks = streaks / np.max(streaks) # Normalize approx 0-1
 
              # Add streaks to the image
              output_image += streaks * intensity_factor * 1.0 # Streaks can be stronger
@@ -330,3 +348,56 @@ def apply_fixed_pattern_noise(image, params, rng):
 
     print(f"Added Fixed Pattern Noise: strength={strength:.3f}, scale={scale:.1f}")
     return output_image, added_noise
+
+
+def apply_edge_brightness(image, params, rng):
+    """
+    Adds brightness along the edges of features in the image.
+    Simulates higher secondary electron yield at edges/slopes.
+    """
+    strength = params.get('strength', 0.3) # How much brighter edges become
+    thickness = params.get('thickness', 1.5) # How thick the bright edge effect is (sigma for blur)
+    # Canny edge detection thresholds
+    low_thresh_factor = params.get('low_thresh_factor', 0.1) # Relative to max image intensity
+    high_thresh_factor = params.get('high_thresh_factor', 0.3) # Relative to max image intensity
+
+    # --- Detect Edges using Canny ---
+    # Need image in 0-255 range for Canny
+    if np.max(image) <= 1.0 and np.min(image) >= 0.0: # Check if likely float 0-1
+        img_uint8 = (image * 255.0).astype(np.uint8)
+    else: # Assume already scaled or convert differently if needed
+         img_uint8 = np.clip(image, 0, 255).astype(np.uint8) # Clip and convert just in case
+
+
+    # Calculate thresholds based on image intensity range (or use fixed if preferred)
+    # Using simple percentile might be more robust than max
+    # med_val = np.median(img_uint8)
+    # low_thresh = int(max(0, (1.0 - 0.33) * med_val))
+    # high_thresh = int(min(255, (1.0 + 0.33) * med_val))
+    # Simpler: use factors of max intensity found
+    max_val = np.max(img_uint8) if np.max(img_uint8) > 0 else 255
+    low_thresh = int(max_val * low_thresh_factor)
+    high_thresh = int(max_val * high_thresh_factor)
+
+    edges = cv2.Canny(img_uint8, low_thresh, high_thresh, L2gradient=True)
+    edges_float = edges.astype(np.float32) / 255.0 # Normalize edge map 0-1
+
+    # --- Blur edges to create the "glow" effect ---
+    # Sigma controls the thickness/spread of the brightness
+    if thickness > 0.1:
+         # Use SciPy Gaussian filter for float images
+         blurred_edges = gaussian_filter(edges_float, sigma=thickness)
+    else:
+         blurred_edges = edges_float # No blur if thickness is negligible
+
+    # Normalize blurred edges again (blurring might change max value)
+    max_be = np.max(blurred_edges)
+    if max_be > 1e-6:
+        blurred_edges /= max_be
+
+    # --- Add edge brightness to the original image ---
+    # Additive effect, scaled by strength
+    output_image = image + blurred_edges * strength
+
+    # print(f"Applied edge brightness: strength={strength:.2f}, thickness={thickness:.2f}") # Debug
+    return np.clip(output_image, 0.0, 1.0)

@@ -53,6 +53,7 @@ def load_config(config_path):
         logger.error(f"Error decoding JSON from: {config_path}")
         raise
 
+
 def override_config(config, overrides):
     """Overrides config dict with values from another dict."""
     for key, value in overrides.items():
@@ -137,14 +138,14 @@ def _recursive_randomize(data, rng):
         # Leaf node (primitive type), return as is
         return data
 
+
 def randomize_config_for_sample(base_config, sample_seed):
     """
     Randomizes a configuration dictionary for a single sample using key-based logic.
     Also handles post-processing like selecting layers and background type.
     """
     rng = get_rng(sample_seed)
-
-    # Create a deep copy to avoid modifying the original base_config
+    logger.debug(f"--- Randomizing config for seed {sample_seed} ---")
     config_copy = copy.deepcopy(base_config)
 
     # Apply the key-based randomization recursively
@@ -154,29 +155,61 @@ def randomize_config_for_sample(base_config, sample_seed):
 
     # Select layers based on the randomized 'probability' in each layer definition
     # and the randomized 'num_layers' value.
+    logger.debug(f"--- Finished recursive randomization for seed {sample_seed} ---")
+
+
+    # Post-processing for layer selection
     if 'layering' in randomized_config and isinstance(randomized_config['layering'], dict):
-        # Note: available_layers are already randomized internally by the recursion
-        available_layers = randomized_config['layering'].get('layers', [])
-        # Get the randomized number of layers (key is now 'num_layers')
-        num_layers_to_gen = randomized_config['layering'].get('num_layers', 1)
+        # Get the list of all possible layer definitions (already randomized internally)
+        all_possible_layers = randomized_config['layering'].get('layers', [])
+        num_layers_to_gen = randomized_config['layering'].get('num_layers', 1) # Randomized number
 
+        # --- Filter layers based on the 'enabled' flag ---
+        # Default to enabled=True if the flag is missing in the config
+        enabled_layers = [
+            layer for layer in all_possible_layers
+            if layer.get('enabled', True) # Check 'enabled', default to True if missing
+        ]
+        logger.debug(f"Found {len(enabled_layers)} enabled layers out of {len(all_possible_layers)}.")
+        # --- End Filter ---
+
+        # --- Select from ENABLED layers based on probability ---
         selected_layers = []
-        # Filter candidates based on their *already randomized* 'probability' value
-        # (the key 'probability' remains after randomization by _recursive_randomize)
-        candidates = [layer for layer in available_layers if rng.random() < layer.get('probability', 1.0)]
+        # Ensure we only work with the enabled layers pool
+        if enabled_layers:
+            candidates = [
+                layer for layer in enabled_layers
+                if rng.random() < layer.get('probability', 1.0) # Check probability
+            ]
+            logger.debug(f"{len(candidates)} layers passed probability check.")
 
-        # Sample selection logic (same as before)
-        if len(candidates) >= num_layers_to_gen:
-             selected_layers = rng.sample(candidates, num_layers_to_gen)
-        else:
-             selected_layers = candidates
-             needed = num_layers_to_gen - len(selected_layers)
-             remaining = [layer for layer in available_layers if layer not in selected_layers]
-             if needed > 0 and remaining:
-                 selected_layers.extend(rng.sample(remaining, min(needed, len(remaining))))
+            # Sample selection logic (using only candidates from enabled layers)
+            target_num = min(num_layers_to_gen, len(enabled_layers)) # Can't select more than available enabled
+
+            if len(candidates) >= target_num:
+                 selected_layers = rng.sample(candidates, target_num)
+            else:
+                 # Take all candidates passing probability, fill remaining needed randomly from other enabled layers
+                 selected_layers = candidates
+                 needed = target_num - len(selected_layers)
+                 remaining_enabled = [layer for layer in enabled_layers if layer not in selected_layers]
+                 if needed > 0 and remaining_enabled:
+                     selected_layers.extend(rng.sample(remaining_enabled, min(needed, len(remaining_enabled))))
 
         randomized_config['layering']['selected_layers'] = selected_layers
-        # logger.debug(f"Selected {len(selected_layers)} layers.")
+        logger.debug(f"Selected {len(selected_layers)} layers for config seed {sample_seed}.")
+
+
+    # Optional Sanity Check for resolution (keep if desired)
+    if 'image_settings' in randomized_config and not isinstance(randomized_config['image_settings'].get('resolution'), list):
+         logger.warning(f"Resolution key 'resolution' in config is not a list after randomization: {randomized_config['image_settings'].get('resolution')}. Check randomization logic.")
+         if isinstance(base_config.get('image_settings', {}).get('resolution'), list):
+              randomized_config['image_settings']['resolution'] = base_config['image_settings']['resolution']
+
+
+    # logger.info(f"Generated randomized config for seed {sample_seed}") # Use debug level maybe
+    return randomized_config
+
 
 
 #    # Store the selected background type.
@@ -198,4 +231,4 @@ def randomize_config_for_sample(base_config, sample_seed):
 #
 #
 #    # logger.info(f"Generated randomized config for seed {sample_seed}")
-    return randomized_config
+#    return randomized_config

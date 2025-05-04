@@ -1,25 +1,29 @@
 import numpy as np
 import cv2
 from skimage.draw import disk, rectangle
+from scipy.ndimage import map_coordinates # Keep if local_elastic still needs it
+
 
 def apply_edge_ripple(mask, params, rng):
     """Applies ripple to shape edges using contour perturbation."""
-    amplitude = params.get('amplitude', 1.5)
-    # Adjust frequency interpretation: higher value means more ripples
-    frequency_factor = params.get('frequency_factor', 10) # How many ripples per unit length approx
-    noise_factor = params.get('noise_factor', 1.0) # Add randomness to ripple
+    amplitude = params.get('amplitude', 2.0) # Increased default example
+    frequency_factor = params.get('frequency_factor', 12)
+    noise_factor = params.get('noise_factor', 1.2) # Increased default example
 
     # Find contours
     contours, hierarchy = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE) # Need all points
-    if not contours: return mask
+    if not contours:
+        return mask
 
     output_mask = np.zeros_like(mask)
     for contour in contours:
-        if len(contour) < 3: continue # Need at least 3 points
+        if len(contour) < 3:
+            continue # Need at least 3 points
 
         perturbed_contour_points = []
         contour_length = cv2.arcLength(contour.astype(np.float32), closed=True)
-        if contour_length < 1e-6: continue # Skip degenerate contours
+        if contour_length < 1e-3:
+            continue # Skip degenerate contours
 
         # Calculate approx distance along contour for frequency calculation
         distances = np.zeros(len(contour))
@@ -61,13 +65,13 @@ def apply_edge_ripple(mask, params, rng):
 
 def apply_breaks_holes(mask, params, rng):
     """Introduces random holes (circular) or breaks (rectangular) into shapes."""
-    count = params.get('count', 2)
+    count = params.get('count', 3)
     size_fraction = params.get('size_fraction', 0.1)
     hole_probability = params.get('hole_probability', 0.6)
-
+    min_defect_size = 3 # Minimum pixels for width/height/radius
+    
     # Find connected components (individual shapes) first
     num_labels, labels_im, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
-
     output_mask = mask.copy()
 
     # Iterate through each component (shape), skipping background label 0
@@ -75,7 +79,8 @@ def apply_breaks_holes(mask, params, rng):
         component_mask = (labels_im == label_id)
         # Get bounding box from stats
         x, y, w, h, area = stats[label_id]
-        if w < 3 or h < 3 or area < 5: continue # Skip tiny components
+        if w < 5 or h < 5 or area < 10:
+            continue # Skip smaller components
 
         for _ in range(count):
             # Find a random point *inside* this specific component
@@ -94,21 +99,19 @@ def apply_breaks_holes(mask, params, rng):
                 continue # Failed to find suitable point for this defect
 
             # Determine defect size relative to component size
-            max_defect_dim = max(3, int(min(w, h) * size_fraction)) # Ensure min size 3
-            defect_size = rng.randint(max(1, max_defect_dim // 3), max_defect_dim) # Range for defect size
+            max_defect_dim = max(min_defect_size, int(min(w, h) * size_fraction))
+            defect_size = rng.randint(min_defect_size, max(min_defect_size + 1, max_defect_dim + 1)) # Ensure range is valid
 
             if rng.random() < hole_probability: # Draw hole (circle)
-                radius = max(1, defect_size // 2)
-                cv2.circle(output_mask, (defect_cx, defect_cy), radius, 0, -1) # Draw black circle
+                radius = max(min_defect_size // 2, defect_size // 2)
+                cv2.circle(output_mask, (defect_cx, defect_cy), radius, 0, -1)
             else: # Draw break (rectangle)
                 angle = rng.uniform(0, 180)
-                rect_w = defect_size
-                rect_h = max(1, rng.randint(max(1, defect_size//4), max(1, defect_size//2))) # Make it elongated
-                # Ensure dimensions are positive
-                rect_w = max(1, rect_w)
-                rect_h = max(1, rect_h)
+                rect_w = max(min_defect_size, defect_size)
+                rect_h = max(min_defect_size, rng.randint(max(1, defect_size//4), max(1, defect_size//2)))
+                rect_w = max(1, rect_w); rect_h = max(1, rect_h)
                 box = cv2.boxPoints(((defect_cx, defect_cy), (rect_w, rect_h), angle))
-                cv2.drawContours(output_mask, [box.astype(int)], 0, 0, -1) # Draw filled black rectangle
+                cv2.drawContours(output_mask, [box.astype(int)], 0, 0, -1)
 
     return output_mask
 
@@ -135,24 +138,27 @@ def apply_local_elastic(mask, params, rng):
 
     # Extract patch
     patch = mask[y0:y1, x0:x1]
-    if patch.size == 0: return mask
+    if patch.size == 0 or patch.shape[0] == 0 or patch.shape[1] == 0: return mask
 
     # Apply elastic to the patch (masks_to_warp is just the patch itself)
-    warped_patch, _, _ = apply_elastic(patch, [patch], params, rng)
+    try:
+        warped_patch_list, _, _ = apply_elastic(patch, [patch], params, rng) # Call global elastic
+        if not warped_patch_list:
+            return mask # Handle case where warp failed
+        warped_patch = warped_patch_list[0]
+        output_mask = mask.copy()
+        # Ensure dimensions match before placing back
+        h_patch, w_patch = warped_patch.shape[:2]
+        output_mask[y0:y0+h_patch, x0:x0+w_patch] = warped_patch
+        # Masking logic (optional, as before)
+        # kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (margin//2, margin//2))
+        # dilated_original = cv2.dilate(mask, kernel)
+        # output_mask &= dilated_original
+        return output_mask
+    except Exception as e:
+        logger.error(f"Error during apply_local_elastic warp: {e}", exc_info=True)
+        return mask # Return original mask on error
 
-    # Create output mask and place warped patch back
-    output_mask = mask.copy()
-    output_mask[y0:y1, x0:x1] = warped_patch[0] # warped_masks_out returns a list
-
-    # Optional: Ensure result doesn't exceed original area significantly?
-    # output_mask &= mask # Intersect? Might remove desired ripple effects.
-    # Maybe dilate original mask slightly for masking?
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (margin//2, margin//2))
-    dilated_original = cv2.dilate(mask, kernel)
-    output_mask &= dilated_original # Keep warp within dilated original area
-
-
-    return output_mask
 
 
 def apply_contour_smoothing(mask, params, rng):
@@ -167,6 +173,7 @@ def apply_contour_smoothing(mask, params, rng):
     smoothed_mask = (blurred_mask > 0.5).astype(np.uint8)
 
     return smoothed_mask
+
 
 def apply_local_brightness(image_layer, mask, params, rng):
      """Applies brightness variation based on Perlin noise, simulating thickness."""
@@ -207,6 +214,110 @@ def apply_local_brightness(image_layer, mask, params, rng):
 
      return output_layer
 
+
+def apply_etch_bias(mask, params, rng):
+    """Applies uniform erosion or dilation to the mask."""
+    # Amount is in pixels: negative=erode, positive=dilate
+    amount = params.get('amount', rng.uniform(-2.0, 2.0)) # Use range from params if present
+    amount_int = int(round(amount))
+
+    if amount_int == 0:
+        return mask # No change
+
+    # Kernel size must be odd and positive
+    k_size = abs(amount_int) * 2 + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
+
+    if amount_int < 0: # Erosion
+        biased_mask = cv2.erode(mask, kernel, iterations=1)
+        print(f"Applied etch bias (erosion): amount={amount_int}")
+    else: # Dilation
+        biased_mask = cv2.dilate(mask, kernel, iterations=1)
+        print(f"Applied etch bias (dilation): amount={amount_int}")
+
+    return biased_mask
+
+
+def apply_local_affine(mask, params, rng):
+    """
+    Applies a small, randomized affine transformation centered on the shape mask.
+    Much faster than elastic deformation for per-instance variation.
+    """
+    if np.sum(mask) < 10: # Skip tiny masks where transform is pointless/problematic
+        return mask
+
+    # Get max variation parameters from config
+    max_scale_delta = params.get('max_scale_delta', 0.03)
+    max_rot_deg = params.get('max_rotation_deg', 3)
+    max_shear_deg = params.get('max_shear_deg', 3)
+    max_trans_frac = params.get('max_translate_fraction', 0.03)
+
+    # --- Calculate transformation center (centroid or bounding box center) ---
+    # Using boundingRect center is usually safer/faster than moments for binary masks
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours: return mask # Should not happen if sum > 0, but safety check
+    x, y, w, h = cv2.boundingRect(contours[0]) # Use first contour's bbox
+    center_x = x + w / 2
+    center_y = y + h / 2
+    center = (center_x, center_y)
+
+    # --- Generate random parameters within limits ---
+    scale = 1.0 + rng.uniform(-max_scale_delta, max_scale_delta)
+    angle = rng.uniform(-max_rot_deg, max_rot_deg)
+    shear = rng.uniform(-max_shear_deg, max_shear_deg)
+    # Translate relative to shape size
+    trans_x = rng.uniform(-max_trans_frac, max_trans_frac) * w
+    trans_y = rng.uniform(-max_trans_frac, max_trans_frac) * h
+
+    # --- Get Affine Matrix ---
+    M_rot_scale = cv2.getRotationMatrix2D(center, angle, scale)
+    # Add translation
+    M_rot_scale[0, 2] += trans_x
+    M_rot_scale[1, 2] += trans_y
+    # Add shear (approximate, applied relative to center after rot/scale/trans)
+    # This requires modifying the matrix elements carefully.
+    shear_rad = np.deg2rad(shear)
+    shear_matrix = np.array([[1, np.tan(shear_rad), 0],
+                             [0, 1,              0]])
+    # To apply shear relative to center, we need to translate center to origin,
+    # shear, then translate back. Or modify M_rot_scale directly (more complex).
+    # Let's modify M_rot_scale - check matrix math:
+    # M = T(center) * Shear * T(-center) * M_rot_scale_trans (approx order)
+    # Simpler approximation for small shear: Add shear term directly?
+    # M_rot_scale[0, 1] += np.tan(shear_rad) # Simple addition, might not be perfectly centered shear
+
+    # --- Alternative: Build matrix step-by-step (more robust centering) ---
+    # 1. Translate center to origin
+    T1 = np.array([[1, 0, -center_x], [0, 1, -center_y], [0, 0, 1]], dtype=float)
+    # 2. Scale
+    S = np.array([[scale, 0, 0], [0, scale, 0], [0, 0, 1]], dtype=float)
+    # 3. Shear
+    Sh = np.array([[1, np.tan(shear_rad), 0], [0, 1, 0], [0, 0, 1]], dtype=float)
+    # 4. Rotate
+    angle_rad_rot = np.deg2rad(angle)
+    cos_a, sin_a = np.cos(angle_rad_rot), np.sin(angle_rad_rot)
+    R = np.array([[cos_a, -sin_a, 0], [sin_a, cos_a, 0], [0, 0, 1]], dtype=float)
+    # 5. Translate back to center AND apply random translation
+    T2 = np.array([[1, 0, center_x + trans_x], [0, 1, center_y + trans_y], [0, 0, 1]], dtype=float)
+
+    # Combine matrices: M = T2 * R * Sh * S * T1
+    M_combined = T2 @ R @ Sh @ S @ T1
+    # Get the final 2x3 matrix for warpAffine
+    M_final = M_combined[0:2, 0:3]
+    # --- End Alternative Matrix Building ---
+
+
+    # --- Apply Transformation ---
+    # Use INTER_NEAREST for masks to avoid creating intermediate gray values
+    # Use BORDER_CONSTANT with value 0 (black background)
+    h_img, w_img = mask.shape
+    warped_mask = cv2.warpAffine(mask, M_final, (w_img, h_img),
+                                 flags=cv2.INTER_NEAREST,
+                                 borderMode=cv2.BORDER_CONSTANT,
+                                 borderValue=0)
+
+    # logger.debug(f"Applied local affine: scale={scale:.3f}, angle={angle:.1f}, shear={shear:.1f}, trans=({trans_x:.1f},{trans_y:.1f})") # Optional debug
+    return warped_mask
 
 # --- Factory (if needed, or call directly in generator) ---
 # Factory function might be less useful here as inputs differ (mask vs image_layer)
