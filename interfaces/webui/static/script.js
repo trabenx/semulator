@@ -180,18 +180,42 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (key.endsWith('_range') && Array.isArray(value) && value.length === 2) {
                     // Create Slider
                     const baseKey = key.replace('_range', '');
-                    const sliderId = `${prefix}.${baseKey}`;
+                    const sliderId = prefix ? `${prefix}.${baseKey}` : baseKey;
                     const row = createFormRow(formatLabel(baseKey), currentContainer); // Use baseKey label
-                    const slider = document.createElement('input'); slider.type = 'range'; slider.id = sliderId; slider.name = sliderId;
-                    const isFloat = !Number.isInteger(value[0]) || !Number.isInteger(value[1]);
-                    const minVal = value[0]; const maxVal = value[1]; const range = maxVal - minVal;
-                    slider.min = minVal; slider.max = maxVal; slider.step = isFloat ? (range / 100 || 0.01).toPrecision(2) : 1; // Avoid step=0
-                    slider.value = configValue[baseKey] !== undefined ? configValue[baseKey] : (minVal + range / 2); // Use base key for default if exists
-                    const valueDisplay = document.createElement('span'); valueDisplay.style.marginLeft = '10px';
-                    valueDisplay.textContent = parseFloat(slider.value).toFixed(isFloat ? 2 : 0);
-                    slider.oninput = () => { valueDisplay.textContent = parseFloat(slider.value).toFixed(isFloat ? 2 : 0); };
-                    row.appendChild(slider); row.appendChild(valueDisplay);
+                    const slider = document.createElement('input');
+					slider.type = 'range';
+					slider.id = sliderId;
+					slider.name = sliderId;
+					
+                    const minVal = Number(value[0]); // Ensure numbers
+                    const maxVal = Number(value[1]);
+                    const isFloat = !Number.isInteger(minVal) || !Number.isInteger(maxVal);
+                    const range = maxVal - minVal;
+					
+                    slider.min = minVal;
+					slider.max = maxVal;
+                    // Ensure step is valid and not zero
+                    let step = isFloat ? (range / 100) : 1;
+                    if (step <= 0) { step = isFloat ? 0.01 : 1; } // Fallback step
+                    slider.step = step.toPrecision(2);
 
+                    // Set default value: Check if baseKey exists (meaning override), else use midpoint
+                    const defaultValue = configValue[baseKey] !== undefined ? configValue[baseKey] : (minVal + range / 2);
+                    slider.value = defaultValue;
+                    // console.log(`Slider ${sliderId}: min=${minVal}, max=${maxVal}, step=${step}, default=${defaultValue}`); // Debug
+
+                    const valueDisplay = document.createElement('span');
+                    valueDisplay.style.marginLeft = '10px';
+                    valueDisplay.style.minWidth = '40px'; // Reserve space
+                    valueDisplay.style.display = 'inline-block'; // Allow width
+                    valueDisplay.textContent = parseFloat(slider.value).toFixed(isFloat ? 2 : 0);
+
+                    slider.oninput = () => {
+                        valueDisplay.textContent = parseFloat(slider.value).toFixed(isFloat ? 2 : 0);
+                    };
+                    row.appendChild(slider);
+                    row.appendChild(valueDisplay);
+					return;
                 } else if (key.endsWith('_choices') && Array.isArray(value)) {
                     // Create Dropdown
                      const baseKey = key.replace('_choices', '');

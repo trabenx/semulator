@@ -1,7 +1,7 @@
 import numpy as np
 import cv2
 from skimage.draw import disk, rectangle
-from scipy.ndimage import map_coordinates # Keep if local_elastic still needs it
+from scipy.ndimage import map_coordinates, binary_erosion
 
 
 def apply_edge_ripple(mask, params, rng):
@@ -158,7 +158,6 @@ def apply_local_elastic(mask, params, rng):
     except Exception as e:
         logger.error(f"Error during apply_local_elastic warp: {e}", exc_info=True)
         return mask # Return original mask on error
-
 
 
 def apply_contour_smoothing(mask, params, rng):
@@ -318,6 +317,58 @@ def apply_local_affine(mask, params, rng):
 
     # logger.debug(f"Applied local affine: scale={scale:.3f}, angle={angle:.1f}, shear={shear:.1f}, trans=({trans_x:.1f},{trans_y:.1f})") # Optional debug
     return warped_mask
+
+
+def apply_shape_border(rendered_instance, mask, params, target_intensity, rng):
+    """
+    Modifies the intensity of the border region of a rendered shape instance.
+
+    Args:
+        rendered_instance (np.ndarray): Float array (HxW) of the already rendered shape.
+        mask (np.ndarray): uint8 binary mask corresponding to the shape.
+        params (dict): Dictionary with 'thickness' and 'intensity_factor'.
+        target_intensity (float): The original target intensity of the shape (before alpha).
+        rng (random.Random): Random number generator.
+
+    Returns:
+        np.ndarray: The modified rendered_instance array.
+    """
+    thickness = params.get('thickness', 1) # Border thickness in pixels
+    # Intensity factor: >1 = brighter border, <1 = darker border, relative to target_intensity
+    intensity_factor = params.get('intensity_factor', 1.5)
+
+    thickness = max(1, int(round(thickness))) # Ensure positive integer thickness
+
+    if np.sum(mask) < 10: # Skip if mask is too small
+        return rendered_instance
+
+    # --- Find the border region ---
+    # Erode the mask. The border is where the original mask is 1 but the eroded mask is 0.
+    # Structure determines connectivity (4 or 8) for erosion
+    structure = np.array([[0,1,0], [1,1,1], [0,1,0]], dtype=bool) # 4-connectivity (more controlled)
+    # structure = np.ones((3,3), dtype=bool) # 8-connectivity
+    try:
+        # Erode requires integer iterations based on thickness
+        inner_mask = binary_erosion(mask, structure=structure, iterations=thickness, border_value=0)
+        border_mask = (mask > 0) & (~inner_mask) # XOR is not quite right, use AND NOT
+    except Exception as e:
+         logger.error(f"Error during border erosion (thickness={thickness}): {e}", exc_info=True)
+         return rendered_instance # Return unchanged on error
+
+    if np.sum(border_mask) == 0: # No border found (maybe shape too thin)
+        return rendered_instance
+
+    # --- Calculate border intensity ---
+    # Apply factor to the original target intensity *before* alpha might have reduced it
+    border_intensity = target_intensity * intensity_factor
+    border_intensity = np.clip(border_intensity, 0.0, 1.0) # Clamp to valid range
+
+    # --- Modify the rendered instance ---
+    output_render = rendered_instance.copy()
+    output_render[border_mask] = border_intensity # Set border pixels to new intensity
+
+    # logger.debug(f"Applied shape border: thickness={thickness}, factor={intensity_factor:.2f}, border_intensity={border_intensity:.2f}") # Debug
+    return output_render
 
 # --- Factory (if needed, or call directly in generator) ---
 # Factory function might be less useful here as inputs differ (mask vs image_layer)
