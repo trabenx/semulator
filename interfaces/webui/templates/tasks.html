@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+
+{% block head %}
+    <title>Generation Tasks</title>
+{% endblock %}
+
+{% block content %}
+    <h1>Generation Tasks</h1>
+    <table border="1" style="width: 100%; border-collapse: collapse;">
+        <thead>
+            <tr>
+                <th>Task ID</th>
+                <th>Status</th>
+                <th>Progress</th>
+                <th>Message / Result</th>
+                <th>Started</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody id="task-list-body">
+            {% for task in tasks %}
+            <tr id="task-row-{{ task.id }}">
+                <td>{{ task.id }}</td>
+                <td class="task-status">{{ task.status }}</td>
+                <td class="task-progress">
+                    {% if task.status == 'RUNNING' or task.status == 'PENDING' %}
+                        <div class="progress-container" style="width: 100px; background-color: #e0e0e0; border-radius: 3px;">
+                             <div class="progress-bar" style="width: {{ task.progress }}%; height: 15px; background-color: #4caf50; border-radius: 3px; font-size: 10px; line-height: 15px; color: white; text-align: center;">
+                                 {{ task.progress }}%
+                             </div>
+                         </div>
+                    {% elif task.status == 'COMPLETED' %}
+                        100%
+                     {% else %}
+                         --
+                     {% endif %}
+                </td>
+                <td class="task-message">{{ task.message or '' }}</td>
+                <td>{{ task.start_time.strftime('%Y-%m-%d %H:%M:%S') if task.start_time else '--' }}</td>
+                <td>
+                    {% if task.status == 'COMPLETED' and task.result_path %}
+                        <a href="{{ url_for('download_task_result', task_id=task.id) }}" download>Download ZIP</a>
+                    {% elif task.status == 'FAILED' %}
+                        <span style="color: red;">Failed</span>
+                    {% elif task.status == 'RUNNING' or task.status == 'PENDING' %}
+                        <i>Running...</i>
+                    {% endif %}
+                     <!-- Add button to view config used? -->
+                     <!-- Add button to delete task record? -->
+                </td>
+            </tr>
+            {% else %}
+            <tr>
+                <td colspan="6">No tasks found.</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    // Add JS for polling task status updates here
+    // e.g., find all rows with status RUNNING/PENDING,
+    // get their task IDs, poll /task_status/<id> endpoint,
+    // update table cells accordingly.
+</script>
+{% endblock %}

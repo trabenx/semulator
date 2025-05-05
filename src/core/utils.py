@@ -24,7 +24,10 @@ def parse_value(value, rng):
             return rng.uniform(value[0], value[1])
     elif isinstance(value, list):
         # Assume choice
-        return rng.choice(value)
+        if not value: # Check if the list is EMPTY
+             logger.warning("Attempted to choose from an empty list. Returning None.")
+             return None # Return None if list is empty
+        return rng.choice(value) # Choose one item
     else:
         # Assume fixed value
         return value

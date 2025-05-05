@@ -79,64 +79,106 @@ def override_config(config, overrides):
     return config
 
 
-def _recursive_randomize(data, rng):
+def _recursive_randomize(data, rng, level=0): # Add level for debug indentation if needed
     """
     Recursively traverses config dict/list to randomize values based on key names.
     Randomizes values associated with keys ending in _range, _choices, _probability.
-    Strips the suffix from the key after randomization.
+    Strips the suffix from the key after randomization. Handles nested structures.
     """
+    indent = "  " * level # For optional debug logging depth
+
+    # Handle Dictionaries
     if isinstance(data, dict):
         new_dict = {}
+        is_potential_artifact_or_layer = 'name' in data or 'layer_id' in data
+        if is_potential_artifact_or_layer:
+             logger.debug(f"{indent}Processing potential artifact/layer dict. Input keys: {list(data.keys())}")
+
+        # logger.debug(f"{indent}Processing dict keys: {list(data.keys())}")
         for key, value in data.items():
-            # --- Revised Suffix Handling ---
-            processed = False
+            # logger.debug(f"{indent} Checking key: '{key}'")
+            processed_suffix = False # Flag if a special suffix was handled
+            new_key = key # Default to original key unless suffix is stripped
+
+            # --- Suffix Handling Logic ---
             if key.endswith('_range'):
                 new_key = key.rsplit('_range', 1)[0]
-                # Ensure value is actually a list/tuple suitable for range parsing
+                # Validate value before parsing
                 if isinstance(value, (list, tuple)) and len(value) == 2:
-                    parsed_value = parse_value(value, rng)
-                    new_dict[new_key] = parsed_value
-                    processed = True
+                    try:
+                        parsed_value = parse_value(value, rng)
+                        new_dict[new_key] = parsed_value
+                        processed_suffix = True
+                        # logger.debug(f"{indent}  Randomized _range '{key}' -> '{new_key}': {parsed_value}")
+                    except Exception as e:
+                         logger.warning(f"{indent}  Error parsing range value for key '{key}': {value}. Error: {e}. Keeping original structure under key '{key}'.")
+                         # Don't set processed_suffix = True, let recursion handle original structure
                 else:
-                    logger.warning(f"Key '{key}' ends with _range but value is not a 2-element list/tuple: {value}. Keeping original.")
-                    new_dict[key] = _recursive_randomize(value, rng) # Recurse into value if structure unknown
+                    logger.warning(f"{indent}  Key '{key}' ends with _range but value is not a 2-element list/tuple: {value}. Keeping original structure.")
+                    # Don't set processed_suffix = True
 
             elif key.endswith('_choices'):
                 new_key = key.rsplit('_choices', 1)[0]
-                # Ensure value is a list suitable for choice parsing
+                # Validate value before parsing
                 if isinstance(value, list):
-                    parsed_value = parse_value(value, rng) # parse_value handles choice from list
-                    new_dict[new_key] = parsed_value # Store the single chosen item
-                    processed = True
+                    try:
+                        parsed_value = parse_value(value, rng) # parse_value handles choice and empty list
+                        if parsed_value is None and not value: # If parse_value returned None because list was empty
+                             logger.warning(f"{indent}  Choice list for key '{key}' was empty. Key '{new_key}' will be missing or None.")
+                             # Option: Store None, or skip adding the key? Let's store None for now.
+                             new_dict[new_key] = None
+                        else:
+                             new_dict[new_key] = parsed_value # Store the single chosen item
+
+                        processed_suffix = True
+                        # logger.debug(f"{indent}  Randomized _choices '{key}' -> '{new_key}': {new_dict.get(new_key)}")
+                    except Exception as e:
+                        logger.warning(f"{indent}  Error parsing choices value for key '{key}': {value}. Error: {e}. Keeping original structure under key '{key}'.")
+                        # Don't set processed_suffix = True
                 else:
-                     logger.warning(f"Key '{key}' ends with _choices but value is not a list: {value}. Keeping original.")
-                     new_dict[key] = _recursive_randomize(value, rng) # Recurse
+                     logger.warning(f"{indent}  Key '{key}' ends with _choices but value is not a list: {value}. Keeping original structure.")
+                     # Don't set processed_suffix = True
 
             elif key.endswith('_probability'):
                  new_key = key.rsplit('_probability', 1)[0]
-                 # Ensure value is suitable for probability parsing (e.g., number or range)
                  try:
-                      parsed_value = parse_value(value, rng)
-                      # Probabilities are usually floats, ensure it's treated as such if needed downstream
+                      parsed_value = parse_value(value, rng) # Handles ranges or single value
+                      # Ensure result is float for probabilities
                       new_dict[new_key] = float(parsed_value) if isinstance(parsed_value, (int, float)) else parsed_value
-                      processed = True
-                 except (TypeError, ValueError):
-                      logger.warning(f"Could not parse probability for key '{key}': {value}. Keeping original.")
-                      new_dict[key] = _recursive_randomize(value, rng) # Recurse
+                      processed_suffix = True
+                      # logger.debug(f"{indent}  Randomized _probability '{key}' -> '{new_key}': {new_dict.get(new_key)}")
+                 except (TypeError, ValueError, Exception) as e:
+                      logger.warning(f"{indent}  Could not parse probability for key '{key}': {value}. Error: {e}. Keeping original structure under key '{key}'.")
+                      # Don't set processed_suffix = True
+            # --- End Suffix Handling Logic ---
 
-            # --- End Revised Suffix Handling ---
 
-            if not processed:
-                # Key doesn't indicate randomization OR failed validation,
-                # so recurse into value if dict/list
-                new_dict[key] = _recursive_randomize(value, rng)
+            # --- Recursion / Assignment ---
+            if not processed_suffix:
+                # If no special suffix was handled (or handling failed validation),
+                # recurse into the value using the ORIGINAL key.
+                new_dict[key] = _recursive_randomize(value, rng, level + 1)
+            # else:
+                # If a suffix *was* handled successfully, the randomized value
+                # was already placed into new_dict[new_key] above. No action needed here.
+
+        # --- DEBUG: Log the dictionary *before* returning ---
+        if is_potential_artifact_or_layer:
+             logger.debug(f"{indent}Returning processed artifact/layer dict. Output keys: {list(new_dict.keys())}")
+             if 'name' not in new_dict and 'layer_id' not in new_dict: # Check if the crucial key is missing
+                  logger.error(f"{indent}!!! ERROR: 'name' or 'layer_id' key MISSING in processed dict: {new_dict}")
+        # ---
+
         return new_dict
+
+    # Handle Lists
     elif isinstance(data, list):
-        # Recurse into list items (important for lists of layers, artifacts, etc.)
-        return [_recursive_randomize(item, rng) for item in data]
+        # logger.debug(f"{indent}Processing list (recursing into items)")
+        return [_recursive_randomize(item, rng, level + 1) for item in data]
     else:
-        # Leaf node (primitive type), return as is
+        # logger.debug(f"{indent}Processing primitive: {data}")
         return data
+
 
 
 def randomize_config_for_sample(base_config, sample_seed):

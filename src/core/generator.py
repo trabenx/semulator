@@ -82,7 +82,6 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
     """Generates a single synthetic SEM sample with all outputs."""
     start_time = time.time()
     sample_rng = get_rng(sample_seed)
-    
     try:
         config = randomize_config_for_sample(base_config, sample_seed)
         artifact_raffle_settings = config.get('artifact_raffle', {})
@@ -140,12 +139,27 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
            config['layering']['selected_layers'] = []
            save_text_file("This is a negative control sample.", sample_output_dir / "negative_control_flag.txt")
 
+        # --- Log config section before Raffler init ---
+        artifact_raffle_settings = config.get('artifact_raffle', 'MISSING')
+        sample_logger.debug(f"Initializing Raffler with artifact_raffle type: {type(artifact_raffle_settings)}")
+        if isinstance(artifact_raffle_settings, dict):
+            shape_artifacts_for_raffler = artifact_raffle_settings.get('categories',{}).get('shape', 'MISSING_SHAPE_CATEGORY')
+            sample_logger.debug(f"Shape artifacts passed to Raffler type: {type(shape_artifacts_for_raffler)}")
+            if isinstance(shape_artifacts_for_raffler, list):
+                 names_for_raffler = [item.get('name', 'NO_NAME') if isinstance(item, dict) else 'INVALID_ITEM_TYPE' for item in shape_artifacts_for_raffler]
+                 sample_logger.debug(f"Shape artifact names for Raffler: {names_for_raffler}")
+            else:
+                sample_logger.error(f"Shape artifacts section for Raffler is not a list: {shape_artifacts_for_raffler}")
+        else:
+            sample_logger.error(f"Artifact raffle section for Raffler is not dict or missing: {artifact_raffle_settings}")
+        # ---
+
         raff = Raffler(config.get('artifact_raffle', {}), sample_rng)
         bg_conf = config.get('background', {})
         background_clean = generate_background(bg_conf, (h, w), magnification, sample_rng) # Pass RNG
         initial_background = background_clean.copy()
         image_clean = background_clean.copy()
-
+        sample_logger.debug("Background generated.")
         all_layers_data = {}
         layer_instance_counts = {}
         layer_masks_original = {}
@@ -153,7 +167,6 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
         layer_defect_masks = {} # Store defect masks per layer
         layer_renders_actual = [] # List of actual rendered layer buffers (float32)
         instance_id_counter = 1
-
         selected_layers = config.get('layering', {}).get('selected_layers', [])
         composition_mode = config.get('layering', {}).get('composition_mode', 'additive')
         randomize_layer_order = config.get('layering', {}).get('randomize_order', False)
@@ -164,7 +177,7 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
         layer_colors = get_distinct_colors(len(selected_layers))
         layer_id_to_color = {i: layer_colors[i] for i in range(len(selected_layers))}
 
-
+        sample_logger.error("1")
         for layer_render_idx, layer_config_idx in enumerate(layer_indices):
             layer_conf = selected_layers[layer_config_idx]
             layer_id_str = f"layer_{layer_config_idx:02d}" # Use index for path
@@ -172,32 +185,38 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
             layer_output_dir = sample_output_dir / "layers" / layer_id_str
             ensure_dir(layer_output_dir)
             sample_logger.info(f"Processing Layer {layer_config_idx}: '{layer_id_name}'")
-
-            shape_type = layer_conf['shape']
-            pattern_type = layer_conf['pattern']
-            intensity = layer_conf['intensity']
+            intensity = layer_conf.get('intensity', 0.5) # Default to 0.5 if missing
+            shape_type = layer_conf.get('shape', 'circle') # Default to circle if missing
             alpha = layer_conf.get('alpha', 1.0)
-            shape_params_base = layer_conf['shape_params']
-            pattern_params = layer_conf['pattern_params']
+            shape_params_base = layer_conf.get('shape_params', {})
+            pattern_params = layer_conf.get('pattern_params', {})
+            pattern_type = layer_conf.get('pattern', 'grid')
+            # --- Add warnings if keys were missing ---
+            if 'intensity' not in layer_conf:
+                 sample_logger.warning(f"Layer config {layer_id_name} missing 'intensity'. Using default {intensity}. Config: {layer_conf}")
+            if 'shape' not in layer_conf:
+                  sample_logger.warning(f"Layer config {layer_id_name} missing 'shape'. Using default {shape_type}. Config: {layer_conf}")
+            if 'pattern' not in layer_conf:
+                  sample_logger.warning(f"Layer config {layer_id_name} missing 'pattern'. Using default {pattern_type}. Config: {layer_conf}")
+            # ---
 
             # Get positions using combined params
             positions = get_pattern_positions(pattern_type, (h, w), shape_params_base, pattern_params, sample_rng)
-
             layer_combined_mask_original = np.zeros((h, w), dtype=np.uint8)
             layer_combined_mask_actual = np.zeros((h, w), dtype=np.uint8)
             layer_render_buffer = np.zeros((h, w), dtype=np.float32) # Float for rendering intensity
             num_instances_in_layer = 0
             applied_shape_artifacts_list = [] # Track artifacts applied in this layer
-
             # --- Raffle artifacts ONCE for the LAYER ---
             # This determines WHICH artifacts *might* be applied to instances in this layer
             layer_shape_artifacts_defs = raff.raffle_effects('shape') # Get definitions {name: ..., params: {..._range: [...]}}
+            print(f'#######################7.{layer_render_idx}##########################')
+
             # Note: raff.raffle_effects already randomized the ranges into single values for the layer
             # We will use these layer-level randomized values as the *center* for per-instance variation
-
             sample_logger.debug(f"Layer {layer_config_idx}: Raffled shape artifacts to potentially apply: {[a['name'] for a in layer_shape_artifacts_defs]}")
-
             for idx, pos in enumerate(positions):
+                print(f'#######################7.{layer_render_idx}.{idx}##########################')
                 shape_params = shape_params_base.copy()
                 if shape_type.endswith('line') and isinstance(pos, tuple) and len(pos) == 2 and isinstance(pos[0], tuple):
                     shape_params['x1'], shape_params['y1'] = pos[0]
@@ -220,6 +239,7 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
                 # Iterate through the artifacts raffled for the LAYER
                 for layer_artifact_def in layer_shape_artifacts_defs:
                     artifact_name = layer_artifact_def['name']
+                    print(f'#######################7.{layer_render_idx}.{idx}.{artifact_name}##########################')
                     # Get the parameters already randomized *for the layer*
                     layer_params = layer_artifact_def['params']
 
@@ -308,6 +328,7 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
                 num_instances_in_layer += 1
                 # instance_id_counter += 1 # Increment only if needed for per-instance tracking
 
+            print('#######################8##########################')
 
             # Clip layer render buffer after all instances are added
             layer_render_buffer = np.clip(layer_render_buffer, 0.0, 1.0)
@@ -348,7 +369,7 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
             if out_opts.get('save_per_layer_renders') and all_layers_data[layer_config_idx]['render'] is not None:
                 save_image_data(all_layers_data[layer_config_idx]['render'], layer_output_dir / "render_actual_vis.png", bit_depth)
 
-
+        sample_logger.debug("Finished layer loop.")
         # 5. Compose Layers
         sample_logger.info(f"Composing {len(layer_renders_actual)} layers using mode: {composition_mode}")
         cumulative_layers_for_gif = [initial_background.copy()]
@@ -371,11 +392,12 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
 
 
         image_clean_pre_warp = image_clean.copy()
-
+        sample_logger.debug("Layers composed.")
         # 6. Generate Combined/Instance Masks (Pre-Warp)
         combined_mask_original_pre_warp = generate_combined_mask(layer_masks_original)
         combined_mask_actual_pre_warp = generate_combined_mask(layer_masks_actual)
         instance_mask_pre_warp, instance_meta = generate_instance_mask(layer_masks_actual, layer_instance_counts)
+        sample_logger.debug("Global geometric artifacts applied.")
 
 
         # 7. Apply Global Artifacts (Geometric, Instrument) - Use Oversized Canvas
@@ -455,6 +477,7 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
 
         image_post_instrument = np.clip(image_post_instrument, 0.0, 1.0)
 
+        sample_logger.debug("Instrument artifacts applied.")
 
         # 8. Apply Detector Noise
         sample_logger.info("Applying detector noise...")
@@ -486,7 +509,7 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
             except Exception as e: sample_logger.error(f"Error applying noise {noise_type}: {e}", exc_info=True)
     
         image_final_noisy = np.clip(image_final_noisy, 0.0, 1.0)
-    
+        sample_logger.debug("Noise applied.")
     
         # 9. Generate Overlays and Final Visualizations
         sample_logger.info("Generating overlays and visualizations...")

@@ -2,6 +2,7 @@ numpy
 opencv-python-headless
 imageio[tif,pyav]
 Flask
+Flask-SQLAlchemy
 scipy
 scikit-image
 Pillow
@@ -9,5 +10,7 @@ perlin-noise
 tifffile
 imagecodecs
 tqdm
+celery[redis] 
+redis
 # Add if needed for specific features, e.g., shapely for complex polygons
 # shapely

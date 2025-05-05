@@ -1,15 +1,19 @@
 import sys
-from pathlib import Path
 import os
 import logging
-import collections.abc # For deep merge
 import json
 import random
 import threading
 import time
-from flask import Flask, render_template, request, jsonify, send_from_directory
-import zipfile
+import copy
 from io import BytesIO
+import zipfile
+from pathlib import Path
+from flask import Flask, render_template, request, jsonify, send_from_directory, send_file, url_for, redirect
+from flask_sqlalchemy import SQLAlchemy
+import datetime
+import collections.abc # For deep merge
+
 
 # --- Add src path ---
 project_root = Path(__file__).resolve().parent.parent.parent # Up 3 levels
@@ -18,19 +22,31 @@ if str(src_path) not in sys.path:
     sys.path.insert(0, str(src_path))
 
 # --- Import Core Components ---
-from src.core.configuration import load_config, override_config
+from src.core.configuration import load_config, override_config, set_nested, randomize_config_for_sample
 from src.core.generator import generate_sample
-from src.core.utils import get_rng, ensure_dir
+from src.core.utils import get_rng, ensure_dir, image_to_bit_depth
+
+from celery_app import celery
 
 # --- Flask App Setup ---
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.urandom(24) # For session management if needed later
+app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', os.urandom(24))
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', f"sqlite:///{project_root / 'dev.db'}")
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
 app.config['BASE_CONFIG_PATH'] = str(project_root / 'config' / 'base_config.json')
-app.config['OUTPUT_DIR'] = str(project_root / 'output_web') # Separate output for web
+app.config['WEB_OUTPUT_DIR'] = os.environ.get('WEB_OUTPUT_DIR', str(project_root / 'output_web'))
+app.config['UPLOAD_FOLDER'] = str(project_root / 'uploads')
+ensure_dir(app.config['WEB_OUTPUT_DIR'])
+ensure_dir(app.config['UPLOAD_FOLDER'])
+
+# --- Import Models AFTER db is initialized ---
+from .models import Task, LayerDefinition
 
 # --- Basic Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
-logger = logging.getLogger('FlaskWebUI')
+logger = app.logger
+logger.setLevel(logging.INFO)
 
 # --- In-memory job tracking (Replace with DB or Redis for production) ---
 jobs = {} # { job_id: {'status': 'running/completed/failed', 'progress': 0, 'output_dir': ...} }
@@ -47,22 +63,40 @@ def generation_worker(job_id, effective_config):
     master_seed = run_settings.get('master_seed', None)
 
     ensure_dir(job_output_dir)
-    if master_seed is None: master_seed = random.randint(0, 2**32 - 1)
+    if master_seed is None:
+        master_seed = random.randint(0, 2**32 - 1)
+        logger.info(f"[Job {job_id}] Generated master seed: {master_seed}")
+    else:
+        logger.info(f"[Job {job_id}] Using provided master seed: {master_seed}")
+
     master_rng = get_rng(master_seed)
+
+    logger.info(f"[Job {job_id}] Generating {num_samples} sample seeds...")
+    sample_seeds = [master_rng.randint(0, 2**32 - 1) for _ in range(num_samples)]
+    logger.info(f"[Job {job_id}] Sample seeds generated.")
 
     logger.info(f"Job {job_id}: Starting generation of {num_samples} samples (Seed: {master_seed})")
     success_count = 0
     try:
         for i in range(num_samples):
             progress = int(((i + 1) / num_samples) * 100)
+            sample_seed_for_worker = sample_seeds[i] # Get the specific seed for this sample
             with job_lock:
                 jobs[job_id]['status'] = 'running'
                 jobs[job_id]['progress'] = progress
-                jobs[job_id]['message'] = f"Generating sample {i+1}/{num_samples}"
+                jobs[job_id]['message'] = f"Generating sample {i+1}/{num_samples} (Seed: {sample_seed_for_worker})"
 
-            logger.info(f"Job {job_id}: Generating sample {i}/{num_samples-1}")
-            if generate_sample(i, effective_config, master_rng, job_output_dir):
+            logger.info(f"Job {job_id}: Generating sample {i} with seed {sample_seed_for_worker}")
+            success = generate_sample(
+                sample_idx=i,
+                sample_seed=sample_seed_for_worker, # Pass integer seed
+                base_config=effective_config,      # Pass full config
+                output_parent_dir=job_output_dir   # Pass job output dir
+            )
+            if success:
                 success_count += 1
+            else:
+                 logger.warning(f"[Job {job_id}] Sample {i} generation returned failure.")
             # time.sleep(0.1) # Remove sleep unless debugging rate limiting issues
 
         with job_lock:
@@ -80,125 +114,172 @@ def generation_worker(job_id, effective_config):
             jobs[job_id]['message'] = f"Error during generation: {e}"
 
 
-# --- Routes ---
-@app.route('/')
-def index():
-    # Load base config to populate the form defaults (simplified)
-    try:
-        base_config = load_config(app.config['BASE_CONFIG_PATH'])
-        # Pass relevant parts of config to template
-        # This needs significant JS on the frontend to be truly dynamic
-        return render_template('index.html', config=base_config)
-    except Exception as e:
-         logger.error(f"Failed to load base config for UI: {e}")
-         return f"Error loading configuration: {e}", 500
-
 def deep_update(source, overrides):
     """
-    Recursively update a dict with values from another dict.
-    Modifies 'source' in place.
+    Recursively update a dict-like structure (source) with values from another (overrides).
+    Modifies 'source' potentially if mutable, but safer to use return value.
+    Handles list vs dict type mismatches.
+    Merges lists by index: applies override item N to source item N.
     """
-    for key, value in overrides.items():
-        if isinstance(value, collections.abc.Mapping) and value:
-            returned = deep_update(source.get(key, {}), value)
-            source[key] = returned
-        elif isinstance(value, list) and value:
-            # Decide on list update strategy: replace or extend? Replace for simplicity now.
-            source[key] = value
+    # If source is not a dictionary, simply return a deep copy of the override
+    # unless the override is None (which might mean no override was intended)
+    if not isinstance(source, collections.abc.Mapping):
+        return copy.deepcopy(overrides) if overrides is not None else source
+
+    # Work on a copy of the source dictionary
+    output = copy.deepcopy(source)
+
+    for key, override_value in overrides.items():
+        source_value = output.get(key) # Get current value from the copied source
+
+        # --- Case 1: Override value is a dictionary ---
+        if isinstance(override_value, collections.abc.Mapping) and override_value:
+            if isinstance(source_value, collections.abc.Mapping):
+                # Both are dicts, recurse
+                output[key] = deep_update(source_value, override_value)
+            else:
+                # Source value is not a dict (or None), replace with override dict
+                output[key] = copy.deepcopy(override_value)
+
+        # --- Case 2: Override value is a list ---
+        elif isinstance(override_value, list):
+            # Check if source value is also a list
+            if isinstance(source_value, list):
+                # --- Merge lists element by element (by index) ---
+                merged_list = []
+                len_source = len(source_value)
+                len_override = len(override_value)
+                max_len = max(len_source, len_override)
+
+                for i in range(max_len):
+                    src_item = source_value[i] if i < len_source else None
+                    ovr_item = override_value[i] if i < len_override else None
+
+                    if ovr_item is None:
+                        # No override for this index, keep source item
+                        merged_list.append(copy.deepcopy(src_item) if src_item is not None else None)
+                    elif src_item is None:
+                        # No source item for this index, add override item
+                        merged_list.append(copy.deepcopy(ovr_item))
+                    elif isinstance(src_item, collections.abc.Mapping) and isinstance(ovr_item, collections.abc.Mapping):
+                        # Both are dicts, recursively merge them
+                        merged_list.append(deep_update(src_item, ovr_item))
+                    else:
+                        # Structures mismatch or not dicts, override takes precedence
+                        merged_list.append(copy.deepcopy(ovr_item))
+                output[key] = merged_list
+                # logger.debug(f"Index-merged list for key '{key}'")
+            else:
+                # Source is not a list, override replaces it entirely
+                output[key] = copy.deepcopy(override_value)
+
+        # --- Case 3: Override value is primitive (or None) ---
         else:
-            source[key] = overrides[key]
-    return source
+            # Directly set/overwrite the value in the output dict
+            output[key] = override_value
+
+    return output
+
 
 
 def parse_form_to_overrides(form_data):
     """
-    Parses Flask form data into a nested dictionary of overrides.
+    Parses Flask form data (ImmutableMultiDict) into a nested dictionary of overrides.
     Assumes form field names use '.' for nesting (e.g., 'a.b.c').
     Handles basic type conversions (int, float, bool).
     Handles '.min'/'.max' suffixes for ranges.
-    Handles '.enabled' suffix for boolean toggles (value 'on' means True).
+    Handles keys corresponding to checkboxes (assumes key presence means 'True').
     """
     overrides = {}
     range_partials = {} # To collect min/max pairs
 
-    # Helper to set nested value
-    def set_nested_value(d, keys, value):
-        keys_list = keys.split('.')
-        current_level = d
-        for key in keys_list[:-1]:
-            if key not in current_level or not isinstance(current_level[key], dict):
-                current_level[key] = {} # Create/overwrite intermediate dicts
-            current_level = current_level[key]
-        current_level[keys_list[-1]] = value
+    # Use the Python set_nested helper defined earlier in this file or imported
+    # def set_nested(d, keys, value, create_missing=True): ...
 
-    for key, value_str in form_data.items():
-        # Skip empty values unless it's a known boolean toggle
-        if not value_str and not key.endswith('.enabled'):
-            continue
+    processed_checkbox_keys = set() # Track checkboxes handled by presence
+
+    # Checkbox handling: Iterate keys first to identify potential checkboxes
+    # A checkbox is only present in form_data if it was checked ('on')
+    # We need to infer 'False' for checkboxes that are *not* in the form_data
+    # but this requires knowing the full expected structure (difficult here).
+    # Simpler approach: If a key exists and corresponds to a known boolean field
+    # treat its presence as True. Otherwise, assume False if not present? Risky.
+    # Safest approach: Rely on the JS sending JSON where unchecked boxes are explicitly false.
+    # For now, let's parse what's *in* the form: presence implies True for relevant keys.
+
+    for key, value_str in form_data.items(multi=True): # Use multi=True if keys can repeat? Usually not for this form.
+        # Skip empty values unless it's meant to clear something (tricky)
+        if not value_str:
+             continue
+
+        parsed_value = None
 
         # Handle range suffixes (.min, .max)
         is_range_min = key.endswith('.min')
         is_range_max = key.endswith('.max')
-        is_enabled_toggle = key.endswith('.enabled')
 
         if is_range_min or is_range_max:
             base_key = key.rsplit('.', 1)[0]
             suffix = key.rsplit('.', 1)[1] # 'min' or 'max'
-
-            if base_key not in range_partials:
-                 range_partials[base_key] = {}
-
-            # Try converting to float or int for ranges
-            try:
+            if base_key not in range_partials: range_partials[base_key] = {}
+            try: # Convert range values to numbers
                 val = float(value_str)
                 if val.is_integer(): val = int(val)
                 range_partials[base_key][suffix] = val
             except ValueError:
                  logger.warning(f"Could not parse range value for {key}: '{value_str}'")
-                 continue # Skip this partial value
+            continue # Move to next form item
 
-        elif is_enabled_toggle:
-             base_key = key.rsplit('.', 1)[0]
-             # Checkboxes submit 'on' when checked, or nothing when unchecked.
-             # We assume if the '.enabled' key exists, it was checked.
-             bool_value = (value_str.lower() == 'on')
-             set_nested_value(overrides, base_key + '.enabled', bool_value) # Store as 'enabled' flag if needed by raffler
-             # Also potentially set the main value based on enabled state? Depends on config structure.
-             # If the config expects just the probability key, the Raffler needs to check '.enabled'.
-             # For simplicity, let's assume the Raffler checks for `params.get('enabled', True)`
+        # Handle regular keys - Attempt conversions
+        try:
+             parsed_value = int(value_str)
+        except ValueError:
+             try:
+                  parsed_value = float(value_str)
+             except ValueError:
+                  # Explicit check for boolean strings
+                  if value_str.lower() in ['true', 'on', 'yes']:
+                       parsed_value = True
+                       # Mark if it was a checkbox based on value='on' convention
+                       if value_str.lower() == 'on': processed_checkbox_keys.add(key)
+                  elif value_str.lower() in ['false', 'off', 'no']:
+                       parsed_value = False
+                  else:
+                       parsed_value = value_str # Keep as string
 
-
-        else: # Handle regular keys
-            value = None
-            # Try conversions in order: int -> float -> bool -> string
-            try:
-                 value = int(value_str)
-            except ValueError:
-                 try:
-                      value = float(value_str)
-                 except ValueError:
-                      # Check for boolean strings explicitly
-                      if value_str.lower() in ['true', 'on', 'yes']:
-                           value = True
-                      elif value_str.lower() in ['false', 'off', 'no']:
-                           value = False
-                      else:
-                           value = value_str # Keep as string if all else fails
-
-            # Set the value in the nested overrides dictionary
-            set_nested_value(overrides, key, value)
+        # Set the value in the nested overrides dictionary
+        # Use the Python set_nested function
+        set_nested(overrides, key, parsed_value)
 
     # Process collected range partials
     for base_key, parts in range_partials.items():
         if 'min' in parts and 'max' in parts:
-             # Ensure min <= max if needed? Or let config validation handle it.
-             range_list = [parts['min'], parts['max']]
-             set_nested_value(overrides, base_key, range_list) # Store range as a list
+             # Add _range suffix back for consistency with JSON/Python config
+             set_nested(overrides, base_key + '_range', [parts['min'], parts['max']])
         else:
              logger.warning(f"Incomplete range found for {base_key}: {parts}")
 
-    logger.debug(f"Parsed form overrides: {json.dumps(overrides, indent=2)}")
+    # Post-process checkbox keys - if a key was identified as checkbox ('on'), ensure it's True
+    # This step might be redundant if 'on' was already parsed to True above.
+    # A more robust way would be needed to handle *unchecked* boxes if not sending JSON.
+    # for key in processed_checkbox_keys:
+    #      set_nested(overrides, key, True) # Ensure it's True
+
+    logger.debug(f"Parsed form overrides (Python): {json.dumps(overrides, indent=2)}")
     return overrides
+
+
+# --- Routes ---
+@app.route('/')
+def index():
+    """ Renders the main generation configuration page. """
+    try:
+        base_config = load_config(app.config['BASE_CONFIG_PATH'])
+        # Pass config as JSON string for JS to parse and build form
+        return render_template('generate.html', config_json=json.dumps(base_config))
+    except Exception as e:
+         logger.error(f"Failed to load base config for UI: {e}", exc_info=True)
+         return f"Error loading configuration: {e}", 500
 
 
 @app.route('/generate', methods=['POST'])
@@ -373,6 +454,7 @@ def download_file_deep(job_id, filepath):
          logger.error(f"Error serving file {filepath} for job {job_id}: {e}")
          return "Error downloading file", 500
 
+
 # Route to download ZIP
 @app.route('/download_zip/<int:job_id>')
 def download_zip(job_id):
@@ -400,14 +482,247 @@ def download_zip(job_id):
          logger.error(f"Error creating ZIP for job {job_id}: {e}")
          return "Error creating ZIP file", 500
 
+
+@app.route('/preview', methods=['POST'])
+def generate_preview():
+    """ Generates a single sample synchronously for preview. """
+    logger.info("Received preview request.")
+    try:
+        if not request.is_json:
+            return jsonify({'status': 'error', 'message': 'Request must be JSON.'}), 400
+
+        payload = request.get_json()
+        received_base_config = payload.get('base_config')
+        form_overrides = payload.get('overrides')
+
+        if not isinstance(received_base_config, dict) or not isinstance(form_overrides, dict):
+            return jsonify({'status': 'error', 'message': 'Invalid payload structure.'}), 400
+
+        # --- Merge overrides onto the received base config ---
+        # Use deepcopy to avoid modifying the received base if it's reused
+        effective_config = deep_update(copy.deepcopy(received_base_config), form_overrides)
+        logger.debug("Preview effective config created after merging overrides.")
+        # ---
+
+
+        # Ensure necessary run settings are present
+        if 'run_settings' not in effective_config:
+            effective_config['run_settings'] = {}
+        preview_seed = effective_config['run_settings'].get('master_seed') # Use seed from effective config
+        if not isinstance(preview_seed, int):
+            preview_seed = random.randint(0, 2**32-1)
+        effective_config['run_settings']['master_seed_used'] = preview_seed
+        temp_output_dir = Path(app.config['WEB_OUTPUT_DIR']) / f"preview_{preview_seed}"
+        ensure_dir(temp_output_dir)
+        sample_seed = get_rng(preview_seed).randint(0, 2**32 - 1)
+
+        # Pass the fully merged effective_config to generate_sample,
+        # which will then call randomize_config_for_sample internally
+        success = generate_sample(0, sample_seed, effective_config, temp_output_dir)
+        # ---
+        logger.info(f"Preview sample generation finished. Success: {success}")
+        if success:
+            preview_img_path_png = temp_output_dir / "sem_00000" / "image_final_noisy_vis.png"
+            preview_img_path_tif = temp_output_dir / "sem_00000.tif"
+            preview_img_path = preview_img_path_png if preview_img_path_png.is_file() else preview_img_path_tif
+            logger.info(f"Looking for preview image at: {preview_img_path}")
+
+            if preview_img_path.is_file():
+                import base64
+                import imageio
+                logger.info("Preview image found. Reading bytes...")
+                img_bytes = preview_img_path.read_bytes()
+                mime_type = f'image/{preview_img_path.suffix.lower().strip(".")}'
+                logger.info(f"Read {len(img_bytes)} bytes, mime_type: {mime_type}")
+                if mime_type == 'image/tif' or mime_type == 'image/tiff':
+                    logger.info("Attempting TIFF to PNG conversion...")
+                    try: # Attempt conversion to PNG for browser
+                        img_arr = imageio.v3.imread(preview_img_path)
+                        logger.debug(f"Read TIFF array shape: {img_arr.shape}, dtype: {img_arr.dtype}")
+                        if img_arr.dtype == np.uint16:
+                            img_arr_u8 = (img_arr / 256).astype(np.uint8)
+                        elif img_arr.dtype != np.uint8: # If not uint16 or uint8, attempt basic scale
+                            img_arr_u8 = np.clip(img_arr, 0, 255).astype(np.uint8)
+                        else:
+                            img_arr_u8 = img_arr # Already uint8
+
+                        png_stream = BytesIO()
+                        imageio.imwrite(png_stream, img_arr_u8, format='png')
+                        img_bytes = png_stream.getvalue()
+                        mime_type = 'image/png'
+                        logger.info("TIFF to PNG conversion successful.")
+                    except Exception as conv_err:
+                        logger.warning(f"Could not convert TIFF preview to PNG: {conv_err}")
+                logger.info("Encoding image to Base64...")
+                encoded_img = base64.b64encode(img_bytes).decode('utf-8')
+                logger.info("Encoding successful. Returning preview.")
+                return jsonify({'status': 'success', 'image_data': encoded_img, 'mime_type': mime_type})
+            else:
+                logger.error(f"Preview image file not found at expected path: {preview_img_path}")
+                return jsonify({'status': 'error', 'message': 'Preview generated but output image not found.'}), 500
+        else:
+            logger.error("Preview generation function returned failure.")
+            return jsonify({'status': 'error', 'message': 'Preview generation failed (check logs).'}), 500
+    except Exception as e:
+        logger.error(f"Error during preview generation: {e}", exc_info=True)
+        return jsonify({'status': 'error', 'message': f'Preview error: {e}'}), 500
+
+@app.route('/start_task', methods=['POST'])
+def start_task():
+    """ Starts a background generation task via Celery. """
+    logger.info("Received request to start generation task.")
+    try:
+        if not request.is_json:
+             return jsonify({'status': 'error', 'message': 'Invalid request format. Expected JSON.'}), 400
+
+        payload = request.get_json()
+        received_base_config = payload.get('base_config')
+        form_overrides = payload.get('overrides')
+
+        if not isinstance(received_base_config, dict) or not isinstance(form_overrides, dict):
+            return jsonify({'status': 'error', 'message': 'Invalid payload structure.'}), 400
+
+        # --- Merge overrides onto the received base config ---
+        effective_config = deep_update(copy.deepcopy(received_base_config), form_overrides)
+        # ---
+
+        # Add output base dir for task worker reference
+        effective_config['_output_base_dir'] = app.config['WEB_OUTPUT_DIR']
+        # Ensure run settings and seed
+        if 'run_settings' not in effective_config: effective_config['run_settings'] = {}
+        effective_config['run_settings'].setdefault('num_samples', 1)
+        if not isinstance(effective_config['run_settings'].get('master_seed'), int):
+             effective_config['run_settings']['master_seed'] = random.randint(0, 2**32-1)
+        effective_config['run_settings']['master_seed_used'] = effective_config['run_settings']['master_seed']
+
+        # --- Create DB Task Record ---
+        new_task = Task(
+            status='PENDING',
+            # Store the *effective* config that includes overrides
+            config_json=json.dumps(effective_config)
+        )
+        db.session.add(new_task); db.session.commit(); task_db_id = new_task.id
+        logger.info(f"Created DB task record with ID: {task_db_id}")
+
+        # --- Launch Celery Task ---
+        from tasks import run_generation_task
+        # Pass the final effective_config to the task
+        celery_task = run_generation_task.delay(task_db_id, effective_config)
+        logger.info(f"Dispatched Celery task {celery_task.id} for DB task {task_db_id}")
+        new_task.celery_task_id = celery_task.id; db.session.commit()
+
+        return jsonify({'status': 'success', 'task_id': task_db_id, 'celery_id': celery_task.id})
+
+    except Exception as e:
+        logger.error(f"Error starting generation task: {e}", exc_info=True)
+        db.session.rollback()
+        return jsonify({'status': 'error', 'message': f'Error starting task: {e}'}), 500
+
+@app.route('/tasks')
+def view_tasks():
+    """ Displays the list of running and completed tasks. """
+    try:
+        # Query tasks, order by start time descending
+        tasks = Task.query.order_by(Task.start_time.desc()).limit(50).all() # Limit for pagination later
+        return render_template('tasks.html', tasks=tasks)
+    except Exception as e:
+        logger.error(f"Error fetching tasks: {e}", exc_info=True)
+        return "Error loading tasks page.", 500
+
+@app.route('/task_status/<int:task_id>')
+def get_task_status(task_id):
+    """ Returns JSON status for AJAX polling. """
+    try:
+        task = Task.query.get_or_404(task_id)
+        response = {
+            'id': task.id,
+            'status': task.status,
+            'progress': task.progress,
+            'message': task.message,
+            'result_path': task.result_path,
+            'celery_id': task.celery_task_id
+        }
+        # Optional: Get more detailed status from Celery backend if needed
+        # if task.celery_task_id:
+        #    async_result = celery.AsyncResult(task.celery_task_id)
+        #    response['celery_state'] = async_result.state
+        #    if async_result.state == 'PROGRESS': response['celery_meta'] = async_result.info
+        #    elif async_result.state == 'FAILURE': response['celery_meta'] = str(async_result.info)
+
+        return jsonify(response)
+    except Exception as e:
+        logger.error(f"Error fetching status for task {task_id}: {e}", exc_info=True)
+        return jsonify({'status': 'error', 'message': f'Error fetching status: {e}'}), 500
+
+@app.route('/download_task/<int:task_id>')
+def download_task_result(task_id):
+    """ Downloads the result ZIP file for a completed task. """
+    try:
+        task = Task.query.get_or_404(task_id)
+        if task.status == 'COMPLETED' and task.result_path and Path(task.result_path).is_file():
+            logger.info(f"Serving download for task {task_id}: {task.result_path}")
+            # Ensure the path is absolute or relative to a known root
+            file_path = Path(task.result_path)
+            if not file_path.is_absolute():
+                # If relative, assume it's relative to the project root or output dir
+                # This depends on how the path was stored by the worker
+                # Let's assume it stored an absolute path or one we can resolve easily
+                pass # Assuming path stored is directly usable by send_file
+
+            return send_file(file_path, as_attachment=True, download_name=file_path.name)
+        elif task.status != 'COMPLETED':
+             return "Task not completed.", 404
+        else:
+             logger.error(f"Result file not found for completed task {task_id}: {task.result_path}")
+             return "Result file not found.", 404
+    except Exception as e:
+        logger.error(f"Error downloading result for task {task_id}: {e}", exc_info=True)
+        return "Error processing download.", 500
+
+# --- Config Import/Export Routes ---
+# @app.route('/export_config', methods=['POST']) ...
+# @app.route('/import_config', methods=['POST']) ...
+
+# --- Layer Configuration Routes (Placeholder) ---
+@app.route('/layers')
+def view_layers():
+     # TODO: Query LayerDefinition model and render template
+     return "Layer configuration page (Not Implemented Yet)", 501
+
+# @app.route('/add_layer', methods=['POST']) ...
+# @app.route('/delete_layer/<int:layer_def_id>', methods=['POST']) ...
+
+
+# --- Initialize DB command ---
+@app.cli.command('init-db')
+def init_db_command():
+    """Creates the database tables."""
+    logger.info("Initializing database...")
+    try:
+        db.create_all()
+        logger.info('Database initialized.')
+    except Exception as e:
+         logger.error(f"Error initializing database: {e}", exc_info=True)
+
+
 # --- Run ---
 def run_webui():
-    ensure_dir(app.config['OUTPUT_DIR'])
-    logger.info(f"Starting Web UI. Output will be in {app.config['OUTPUT_DIR']}")
-    # Use waitress or gunicorn for production instead of app.run()
-    # from waitress import serve
-    # serve(app, host='0.0.0.0', port=5000)
-    app.run(debug=False, host='0.0.0.0', port=5000) # Turn debug off for stability with threading
+    # Make sure DB exists before running
+    db_path = Path(app.config['SQLALCHEMY_DATABASE_URI'].replace('sqlite:///', ''))
+    if not db_path.exists():
+         logger.warning(f"Database file not found at {db_path}. Creating tables.")
+         logger.warning("Run 'flask init-db' from the command line in your project root if needed.")
+         with app.app_context(): # Need app context for db.create_all()
+             try:
+                 db.create_all()
+                 logger.info("Database tables created.")
+             except Exception as e:
+                  logger.error(f"Failed to create database tables automatically: {e}")
+
+    logger.info(f"Starting Flask Web UI. Output base: {app.config['WEB_OUTPUT_DIR']}")
+    # Use waitress or gunicorn in production
+    app.run(debug=False, host='0.0.0.0', port=5000)
+
 
 
 # Example of running webui directly (can be called from main.py)

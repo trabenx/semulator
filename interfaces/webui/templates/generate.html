@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+
+{% block head %}
+    <title>Generate Dataset</title>
+{% endblock %}
+
+{% block content %}
+    <h1>Generate Dataset</h1>
+
+    <div style="display: flex; gap: 20px;">
+        <!-- Configuration Form -->
+        <div style="flex: 2;">
+            <h2>Configuration</h2>
+            <form id="generate-form">
+                <div id="config-form-container">
+                    <!-- JS will populate this based on config_json -->
+                    Loading configuration form...
+                </div>
+                <hr>
+                <button type="button" id="preview-button">Generate Preview</button>
+                <button type="submit" id="generate-button">Start Dataset Generation Task</button>
+                <br><br>
+                <button type="button" id="export-config-button">Export Current Config</button>
+                <label for="import-config-input" class="button-like">Import Config File</label>
+                <input type="file" id="import-config-input" accept=".json" style="display: none;">
+
+            </form>
+             <div id="start-task-status" style="margin-top: 10px;"></div>
+        </div>
+
+        <!-- Preview Area -->
+        <div style="flex: 1;">
+            <h2>Preview</h2>
+            <div id="preview-area" style="min-height: 200px; border: 1px solid #ccc; background-color: #eee; display: flex; align-items: center; justify-content: center;">
+                Click "Generate Preview"
+            </div>
+            <div id="preview-error" style="color: red;"></div>
+        </div>
+    </div>
+
+    <!-- Hidden config data for JS -->
+    <script id="config-data" type="application/json">{{ config_json | safe }}</script>
+{% endblock %}
+
+{% block scripts %}
+    <!-- Add specific JS logic for generate page if needed -->
+{% endblock %}
