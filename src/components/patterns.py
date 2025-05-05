@@ -1,6 +1,8 @@
 import numpy as np
 import random
 import math
+import logging # Import logging
+logger = logging.getLogger(__name__)
 
 def _get_shape_dimensions(params):
     """Helper to estimate main dimensions (width, height) from shape params."""
@@ -91,7 +93,6 @@ def generate_hex_grid_positions(size, params, rng):
                 positions.append((int(x), int(y)))
     return positions
 
-
 def generate_radial_grid_positions(size, params, rng):
     h, w = size
     center_x, center_y = w // 2, h // 2
@@ -122,7 +123,6 @@ def generate_radial_grid_positions(size, params, rng):
             if 0 <= x < w and 0 <= y < h:
                 positions.append((int(x), int(y)))
     return positions
-
 
 def generate_random_scatter_positions(size, params, rng):
     h, w = size
@@ -170,6 +170,52 @@ def generate_full_span_horizontal_positions(size, params, rng):
              positions.append((pt1, pt2))
     return positions
 
+def generate_sine_wave_horizontal_paths(size, params, rng):
+    """
+    Generates paths (lists of points) for horizontal sine waves.
+    """
+    h, w = size
+    num_waves = params.get('num_waves', 5)
+    vertical_spacing = params.get('vertical_spacing', h / (num_waves + 1))
+    amplitude = params.get('amplitude', vertical_spacing * 0.3) # Wave height relative to spacing
+    wavelength = params.get('wavelength', w / 3.0) # How many waves fit horizontally approx
+    phase_shift_deg = rng.uniform(0, 360) # Random start phase per layer
+    vertical_jitter = params.get('vertical_jitter_fraction', 0.1) * vertical_spacing # Jitter relative to spacing
+    points_per_wavelength = params.get('points_per_wavelength', 20) # Controls smoothness
+
+    if wavelength < 1: wavelength = 1 # Avoid division by zero
+
+    # Calculate number of points needed across width
+    num_segments = max(10, int(round((w / wavelength) * points_per_wavelength)))
+    x_coords = np.linspace(0, w - 1, num_segments)
+
+    paths = [] # List to hold the point lists for each wave
+
+    # Calculate base y positions, centered vertically
+    total_height_approx = (num_waves - 1) * vertical_spacing
+    start_y = (h - total_height_approx) / 2
+
+    for i in range(num_waves):
+        # Calculate base y with jitter
+        base_y = start_y + i * vertical_spacing
+        current_y_jitter = rng.uniform(-vertical_jitter, vertical_jitter)
+        base_y += current_y_jitter
+
+        # Individual phase shift per wave (optional, adds more variation)
+        wave_phase_shift_rad = np.deg2rad(phase_shift_deg + rng.uniform(-10, 10)) # Small extra random phase per wave
+
+        # Calculate y coords for this wave
+        y_coords = base_y + amplitude * np.sin(
+            (2 * np.pi * x_coords / wavelength) + wave_phase_shift_rad
+        )
+
+        # Combine into list of points, ensuring integer coordinates
+        wave_path = list(zip(x_coords.astype(int), y_coords.astype(int)))
+        paths.append(wave_path)
+
+    logger.debug(f"Generated {len(paths)} sine wave paths.")
+    return paths # Returns list of lists of points
+
 def get_pattern_positions(pattern_type, size, shape_params, pattern_params, rng):
     """Factory to get positions based on pattern type."""
     # Combine params, giving pattern_params precedence for pattern-specific keys
@@ -177,20 +223,14 @@ def get_pattern_positions(pattern_type, size, shape_params, pattern_params, rng)
     combined_params = shape_params.copy()
     combined_params.update(pattern_params)
 
-    if pattern_type == 'single':
-        return generate_single_position(size, combined_params)
-    elif pattern_type == 'grid':
-        return generate_grid_positions(size, combined_params, rng)
-    elif pattern_type == 'hex_grid':
-        return generate_hex_grid_positions(size, combined_params, rng)
-    elif pattern_type == 'radial_grid':
-        return generate_radial_grid_positions(size, combined_params, rng)
-    elif pattern_type == 'random_scatter':
-        return generate_random_scatter_positions(size, combined_params, rng)
-    elif pattern_type == 'full_span_vertical':
-        return generate_full_span_vertical_positions(size, combined_params, rng)
-    elif pattern_type == 'full_span_horizontal':
-        return generate_full_span_horizontal_positions(size, combined_params, rng)
+    if pattern_type == 'single': return generate_single_position(size, combined_params)
+    elif pattern_type == 'grid': return generate_grid_positions(size, combined_params, rng)
+    elif pattern_type == 'hex_grid': return generate_hex_grid_positions(size, combined_params, rng)
+    elif pattern_type == 'radial_grid': return generate_radial_grid_positions(size, combined_params, rng)
+    elif pattern_type == 'random_scatter': return generate_random_scatter_positions(size, combined_params, rng)
+    elif pattern_type == 'full_span_vertical': return generate_full_span_vertical_positions(size, combined_params, rng)
+    elif pattern_type == 'full_span_horizontal': return generate_full_span_horizontal_positions(size, combined_params, rng)
+    elif pattern_type == 'sine_wave_horizontal': return generate_sine_wave_horizontal_paths(size, combined_params, rng)
     else:
         print(f"Warning: Pattern type '{pattern_type}' not implemented.")
         return []

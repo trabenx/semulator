@@ -146,8 +146,38 @@
            "rotation_range": [-45, 45]
         },
         "pattern_params": { "num_shapes_range": [5, 12] }
+      },
+      {
+        "layer_id": "sine_waves_horizontal",
+        "enabled": true,
+        "probability": 0.10, 
+        "shape": "line", 
+        "pattern": "sine_wave_horizontal", 
+        "intensity_range": [0.6, 0.9], 
+        "alpha_range": [0.8, 1.0],
+        "shape_params": { "thickness_range": [4, 12]},
+        "pattern_params": {
+            "num_waves_range": [3, 10],        
+            "vertical_spacing_range": [15, 50], 
+            "vertical_jitter_fraction_range": [0.0, 0.15], 
+            "amplitude_range": [5, 25],       
+            "wavelength_range": [50, 200],    
+            "points_per_wavelength_range": [15, 30] 
+        },
+        "__comment": "Horizontal sine wave patterns"
+      },
+	  {
+        "layer_id": "photonic_crystal_holes",
+        "enabled": true,
+        "probability": 0.10,
+        "shape": "circle", 
+        "pattern": "hex_grid", 
+        "intensity_range": [0.0, 0.1], 
+        "alpha_range": [0.95, 1.0], 
+        "shape_params": { "radius_range": [8, 20] },
+        "pattern_params": { "spacing_factor_range": [1.8, 3.0], "jitter_fraction_range": [0.0, 0.08]  },
+        "__comment": "Dark holes in hex pattern. Needs bright background/underlayer."
       }
-
     ]
   },
   "artifact_raffle": {

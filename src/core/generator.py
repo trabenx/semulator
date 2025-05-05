@@ -2,6 +2,7 @@ import numpy as np
 import cv2
 import os
 import time
+import copy
 import logging
 import imageio
 from pathlib import Path
@@ -169,16 +170,19 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
 
         image_clean = background_clean.copy()
         sample_logger.debug("Background generated.")
+        
         all_layers_data = {}
         layer_instance_counts = {}
         layer_masks_original = {}
         layer_masks_actual = {}
         layer_defect_masks = {} # Store defect masks per layer
         layer_renders_actual = [] # List of actual rendered layer buffers (float32)
+
         instance_id_counter = 1
-        selected_layers = config.get('layering', {}).get('selected_layers', [])
-        composition_mode = config.get('layering', {}).get('composition_mode', 'additive')
-        randomize_layer_order = config.get('layering', {}).get('randomize_order', False)
+        layering_conf = config.get('layering', {})
+        selected_layers = layering_conf.get('selected_layers', [])
+        composition_mode = layering_conf.get('composition_mode', 'additive')
+        randomize_layer_order = layering_conf.get('randomize_order', False) # Use randomized value
 
         layer_indices = list(range(len(selected_layers)))
         if randomize_layer_order: sample_rng.shuffle(layer_indices)
@@ -194,27 +198,30 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
             ensure_dir(layer_output_dir)
             sample_logger.info(f"Processing Layer {layer_config_idx}: '{layer_id_name}'")
             intensity = layer_conf.get('intensity', 0.5) # Default to 0.5 if missing
-            shape_type = layer_conf.get('shape', 'circle') # Default to circle if missing
+            # --- Handle shape_choices vs shape ---
+            if 'shape' in layer_conf:
+                 shape_type = layer_conf.get('shape', 'circle')
+            elif 'shape_choices' in layer_conf: # Check if selection was made by randomization
+                 # The key should be 'shape' after randomization if _choices was used
+                 shape_type = layer_conf.get('shape', 'circle') # Get randomized value
+                 if isinstance(shape_type, list): # Safety check if randomization failed
+                     sample_logger.warning(f"Shape type for layer {layer_id_name} is still list, choosing randomly: {shape_type}")
+                     shape_type = sample_rng.choice(shape_type) if shape_type else 'circle'
+            else:
+                 sample_logger.warning(f"Layer {layer_id_name} missing 'shape' or 'shape_choices'. Defaulting to circle.")
+                 shape_type = 'circle'
+            # ---
+
             alpha = layer_conf.get('alpha', 1.0)
             shape_params_base = layer_conf.get('shape_params', {})
             pattern_params = layer_conf.get('pattern_params', {})
             pattern_type = layer_conf.get('pattern', 'grid')
-            # --- Add warnings if keys were missing ---
             if 'intensity' not in layer_conf:
-                 sample_logger.warning(f"Layer config {layer_id_name} missing 'intensity'. Using default {intensity}. Config: {layer_conf}")
-            if 'shape' not in layer_conf:
-                  sample_logger.warning(f"Layer config {layer_id_name} missing 'shape'. Using default {shape_type}. Config: {layer_conf}")
+                sample_logger.warning(f"Layer config {layer_id_name} missing 'intensity'. Using default {intensity}. Config: {layer_conf}")
             if 'pattern' not in layer_conf:
-                  sample_logger.warning(f"Layer config {layer_id_name} missing 'pattern'. Using default {pattern_type}. Config: {layer_conf}")
+                sample_logger.warning(f"Layer config {layer_id_name} missing 'pattern'. Using default {pattern_type}. Config: {layer_conf}")
             # ---
 
-            # Get positions using combined params
-            positions = get_pattern_positions(pattern_type, (h, w), shape_params_base, pattern_params, sample_rng)
-            layer_combined_mask_original = np.zeros((h, w), dtype=np.uint8)
-            layer_combined_mask_actual = np.zeros((h, w), dtype=np.uint8)
-            layer_render_buffer = np.zeros((h, w), dtype=np.float32) # Float for rendering intensity
-            num_instances_in_layer = 0
-            applied_shape_artifacts_list = [] # Track artifacts applied in this layer
             target_intensity = layer_conf.get('intensity', 0.5) # Store original target intensity
             # This determines WHICH artifacts *might* be applied to instances in this layer
             layer_shape_artifacts_defs = raff.raffle_effects('shape') # Get definitions {name: ..., params: {..._range: [...]}}
@@ -252,148 +259,232 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
                     layer_brightness_noise_map = None # Ensure it's None on error
             # --- End Pre-generation ---
 
+            # Get positions using combined params
+            positions_or_paths = get_pattern_positions(pattern_type, (h, w), shape_params_base, pattern_params, sample_rng)
+            is_path_based = pattern_type in ['sine_wave_horizontal'] # Add future path patterns here
+
+            # --- Initialize Layer Accumulators ---
+            layer_combined_mask_original = np.zeros((h, w), dtype=np.uint8)
+            layer_combined_mask_actual = np.zeros((h, w), dtype=np.uint8)
+            layer_render_buffer = np.zeros((h, w), dtype=np.float32) # Float for rendering intensity
+            num_instances_in_layer = 0
+            applied_shape_artifacts_list = [] # Track artifacts applied in this layer
+
 
             # Note: raff.raffle_effects already randomized the ranges into single values for the layer
             # We will use these layer-level randomized values as the *center* for per-instance variation
             sample_logger.debug(f"Layer {layer_config_idx}: Raffled shape artifacts to potentially apply: {[a['name'] for a in layer_shape_artifacts_defs]}")
-            for idx, pos in enumerate(positions):
-                shape_params = shape_params_base.copy()
-                if shape_type.endswith('line') and isinstance(pos, tuple) and len(pos) == 2 and isinstance(pos[0], tuple):
-                    shape_params['x1'], shape_params['y1'] = pos[0]
-                    shape_params['x2'], shape_params['y2'] = pos[1]
-                elif isinstance(pos, tuple) and len(pos) == 2 and isinstance(pos[0], (int, float)):
-                    shape_params['center_x'], shape_params['center_y'] = pos
-                else:
-                    sample_logger.warning(f"Unsupported position format for shape {shape_type}: {pos}")
-                    continue
-
-                # --- Generate Original Mask (Per Instance) ---
-                original_mask_instance = create_shape_mask(shape_type, shape_params, (h, w), rng=sample_rng)
-                if np.sum(original_mask_instance) == 0:
-                    continue # Skip if shape is empty/outside bounds
-                layer_combined_mask_original |= original_mask_instance
-
-                # 2. Apply MASK-MODIFYING Artifacts with Per-Instance Variation
-                actual_mask_instance = original_mask_instance.copy()
+            for idx, item in enumerate(positions_or_paths):
+                shape_params = copy.deepcopy(shape_params_base) # Use deep copy for safety
+                
+                # --- Declare variables used in both branches ---
+                original_mask_instance = None
+                actual_mask_instance = None
+                instance_render = None
                 applied_mask_artifacts_instance = []
-                for layer_artifact_def in layer_shape_artifacts_defs:
-                    artifact_name = layer_artifact_def['name']
-
-                    # Skip render artifacts in this first pass
-                    if artifact_name in SHAPE_RENDER_ARTIFACT_FUNCS:
-                        continue
-
-                    # Get the parameters already randomized *for the layer*
-                    layer_params = layer_artifact_def['params']
-
-                    # --- Create Per-Instance Parameters ---
-                    # Slightly vary the parameters around the layer's values
-                    # Add a small random offset (e.g., +/- 10-20% of the layer value)
-                    instance_params = {}
-                    variation_factor = 0.2 # Example: Allow +/- 20% variation per instance                
-                    affine_variation_factor = 0.1
-                    current_variation = variation_factor if artifact_name != 'local_affine' else affine_variation_factor
-
-                    for p_name, p_val in layer_params.items():
-                        if isinstance(p_val, (int, float)):
-                            offset = p_val * current_variation * sample_rng.uniform(-1.0, 1.0)
-                            if isinstance(p_val, int):
-                                instance_params[p_name] = max(0, int(round(p_val + offset)))
-                            else:
-                                instance_params[p_name] = p_val + offset
-                        else:
-                            instance_params[p_name] = p_val
-
-                    # --- Conditional Application of Geometric Artifact ---
-                    apply_this_artifact = True
-                    target_mask_artifact_func = None
-                    if artifact_name == 'local_elastic':
-                        if geom_mode != 'local_elastic':
-                            apply_this_artifact = False
-                        else:
-                            target_mask_artifact_func = SHAPE_MASK_ARTIFACT_FUNCS.get(artifact_name)
-                    elif artifact_name == 'local_affine':
-                        if geom_mode != 'local_affine':
-                            apply_this_artifact = False
-                        else:
-                            target_mask_artifact_func = SHAPE_MASK_ARTIFACT_FUNCS.get(artifact_name)
-                    elif artifact_name in SHAPE_MASK_ARTIFACT_FUNCS: # Other mask artifacts
-                         target_mask_artifact_func = SHAPE_MASK_ARTIFACT_FUNCS.get(artifact_name)
-                    else:
-                         apply_this_artifact = False # Not a known mask artifact
-
-
-                    # Apply the mask artifact
-                    if apply_this_artifact and target_mask_artifact_func:
-                        try:
-                            actual_mask_instance = target_mask_artifact_func(actual_mask_instance, instance_params, sample_rng)
-                            applied_mask_artifacts_instance.append(artifact_name)
-                        except Exception as e:
-                             sample_logger.error(f"Error applying mask artifact {artifact_name} to instance {idx}: {e}", exc_info=True)
-                    elif apply_this_artifact and not target_mask_artifact_func:
-                        sample_logger.warning(f"Mask artifact function '{artifact_name}' not found in map.")
-
-
-                # 3. Initial Render based on FINAL Actual Mask
-                instance_render = np.zeros_like(layer_render_buffer)
-                instance_render[actual_mask_instance > 0] = target_intensity * alpha # Use original target intensity and alpha
-
-                # 4. Apply RENDER-MODIFYING Artifacts (Border, Brightness)
                 applied_render_artifacts_instance = []
-                # Order matters: Apply border first, then brightness? Or vice-versa? Let's do border first.
-                render_artifact_order = ['shape_border', 'local_brightness']
 
-                for artifact_name in render_artifact_order:
-                    # Find if this artifact was raffled for the layer
-                    render_artifact_def = next((a for a in layer_shape_artifacts_defs if a['name'] == artifact_name), None)
-                    if render_artifact_def:
-                        target_render_artifact_func = SHAPE_RENDER_ARTIFACT_FUNCS.get(artifact_name)
-                        if target_render_artifact_func:
+                # Branch A: Path-Based (e.g., Sine Wave)
+                if is_path_based:
+                    path_points = item
+                    if not path_points or len(path_points) < 2: continue
+
+                    thickness = shape_params.get('thickness', 2) # Get thickness from shape params
+                    thickness = max(1, int(round(thickness)))
+
+                    # 1. Create initial mask by drawing path
+                    temp_mask = np.zeros((h, w), dtype=np.uint8)
+                    pts_np = np.array([path_points], dtype=np.int32)
+                    cv2.polylines(temp_mask, pts_np, isClosed=False, color=1, thickness=thickness)
+                    original_mask_instance = temp_mask
+                    if np.sum(original_mask_instance) == 0: continue # Skip if path outside bounds
+
+                    # 2. Apply Mask Artifacts
+                    actual_mask_instance = original_mask_instance.copy()
+                    for layer_artifact_def in layer_shape_artifacts_defs:
+                        artifact_name = layer_artifact_def.get('name')
+                        if not artifact_name or artifact_name in SHAPE_RENDER_ARTIFACT_FUNCS or artifact_name == 'etch_bias': continue # Skip render/layer artifacts
+
+                        # --- *** START INSERTED CODE *** ---
+                        # Create Per-Instance Parameters with Variation
+                        layer_params = layer_artifact_def.get('params', {})
+                        instance_params = {}
+                        variation_factor = 0.2 # Base variation
+                        affine_variation_factor = 0.1 # Smaller variation for affine
+                        current_variation = variation_factor if artifact_name != 'local_affine' else affine_variation_factor
+                        for p_name, p_val in layer_params.items():
+                            if isinstance(p_val, (int, float)):
+                                offset = p_val * current_variation * sample_rng.uniform(-1.0, 1.0)
+                                if isinstance(p_val, int): instance_params[p_name] = max(0, int(round(p_val + offset)))
+                                else: instance_params[p_name] = p_val + offset
+                            else: instance_params[p_name] = p_val # Keep non-numeric
+
+                        # Check Mode & Get Function for Geometric Artifacts
+                        apply_this_artifact = True
+                        target_mask_artifact_func = None
+                        if artifact_name == 'local_elastic':
+                            if geom_mode != 'local_elastic': apply_this_artifact = False
+                            else: target_mask_artifact_func = SHAPE_MASK_ARTIFACT_FUNCS.get(artifact_name)
+                        elif artifact_name == 'local_affine':
+                            if geom_mode != 'local_affine': apply_this_artifact = False
+                            else: target_mask_artifact_func = SHAPE_MASK_ARTIFACT_FUNCS.get(artifact_name)
+                        elif artifact_name in SHAPE_MASK_ARTIFACT_FUNCS: # Other mask artifacts
+                              target_mask_artifact_func = SHAPE_MASK_ARTIFACT_FUNCS.get(artifact_name)
+                        else: apply_this_artifact = False # Not a known mask artifact
+                        # --- *** END INSERTED CODE *** ---
+
+                        if apply_this_artifact and target_mask_artifact_func:
                             try:
-                                # Create instance params with variation (as before)
-                                instance_params = {} # ... vary params ...
-                                variation_factor = 0.2 # Example factor
-                                layer_params = render_artifact_def['params']
-                                for p_name, p_val in layer_params.items():
-                                    if isinstance(p_val, (int, float)):
-                                        offset = p_val * variation_factor * sample_rng.uniform(-1.0, 1.0)
-                                        if isinstance(p_val, int): instance_params[p_name] = max(0, int(round(p_val + offset))) # thickness needs int? Check func
-                                        else: instance_params[p_name] = p_val + offset
-                                    else: instance_params[p_name] = p_val
+                                actual_mask_instance = target_mask_artifact_func(actual_mask_instance, instance_params, sample_rng)
+                                applied_mask_artifacts_instance.append(artifact_name)
+                            except Exception as e: sample_logger.error(f"Error applying mask artifact {artifact_name} to path instance {idx}: {e}", exc_info=True)
+
+                    # 3. Initial Render (using final mask)
+                    instance_render = np.zeros_like(layer_render_buffer)
+                    instance_render[actual_mask_instance > 0] = intensity * alpha # Apply intensity
+
+                    # 4. Apply Render Artifacts
+                    render_artifact_order = ['shape_border', 'local_brightness']
+                    for artifact_name in render_artifact_order:
+                          render_artifact_def = next((a for a in layer_shape_artifacts_defs if a.get('name') == artifact_name), None)
+                          if render_artifact_def:
+                               target_render_artifact_func = SHAPE_RENDER_ARTIFACT_FUNCS.get(artifact_name)
+                               if target_render_artifact_func:
+                                    try:
+                                        # *** Re-vary params specific to this render artifact ***
+                                        layer_params_render = render_artifact_def.get('params', {})
+                                        instance_params_render = {}
+                                        variation_factor = 0.2 # Use appropriate variation
+                                        for p_name, p_val in layer_params_render.items():
+                                            if isinstance(p_val, (int, float)):
+                                                offset = p_val * variation_factor * sample_rng.uniform(-1.0, 1.0)
+                                                if isinstance(p_val, int): instance_params_render[p_name] = max(1, int(round(p_val + offset))) # Ensure thickness > 0 for border
+                                                else: instance_params_render[p_name] = p_val + offset
+                                            else: instance_params_render[p_name] = p_val
+                                        # ***
+
+                                        if artifact_name == 'shape_border':
+                                            instance_render = target_render_artifact_func(instance_render, actual_mask_instance, instance_params_render, intensity, sample_rng)
+                                        elif artifact_name == 'local_brightness':
+                                            if layer_brightness_noise_map is not None:
+                                                instance_contrast = instance_params_render.get('contrast', 0.1)
+                                                noise_slice = layer_brightness_noise_map[actual_mask_instance > 0]
+                                                brightness_variation = noise_slice * instance_contrast
+                                                instance_render[actual_mask_instance > 0] *= (1.0 + brightness_variation)
+                                                instance_render = np.clip(instance_render, 0.0, 1.0)
+                                            else: sample_logger.warning("Skipping local_brightness (no noise map).")
+                                        applied_render_artifacts_instance.append(artifact_name)
+                                    except Exception as e: sample_logger.error(f"Error applying render artifact {artifact_name} to path instance {idx}: {e}", exc_info=True)
+
+                # Branch B: Position-Based (Existing Shapes)
+                else:
+                    pos = item
+                    # --- Set shape params based on position type ---
+                    if shape_type.endswith('line') and isinstance(pos, tuple) and len(pos) == 2 and isinstance(pos[0], tuple):
+                         shape_params['x1'], shape_params['y1'] = pos[0]
+                         shape_params['x2'], shape_params['y2'] = pos[1]
+                    elif isinstance(pos, tuple) and len(pos) == 2 and isinstance(pos[0], (int, float)):
+                         shape_params['center_x'], shape_params['center_y'] = pos
+                    else:
+                         sample_logger.warning(f"Unsupported position format for shape {shape_type}: {pos}. Skipping instance.")
+                         continue
+
+                    # 1. Generate Original Mask
+                    original_mask_instance = create_shape_mask(shape_type, shape_params, (h, w), rng=sample_rng)
+                    if np.sum(original_mask_instance) == 0: continue
+
+                    # 2. Apply MASK-MODIFYING Artifacts
+                    actual_mask_instance = original_mask_instance.copy()
+                    for layer_artifact_def in layer_shape_artifacts_defs:
+                        artifact_name = layer_artifact_def.get('name')
+                        if not artifact_name or artifact_name in SHAPE_RENDER_ARTIFACT_FUNCS or artifact_name == 'etch_bias': continue
+
+                        # --- *** START INSERTED CODE *** ---
+                        # Create Per-Instance Parameters with Variation
+                        layer_params = layer_artifact_def.get('params', {})
+                        instance_params = {}
+                        variation_factor = 0.2; affine_variation_factor = 0.1
+                        current_variation = variation_factor if artifact_name != 'local_affine' else affine_variation_factor
+                        for p_name, p_val in layer_params.items():
+                            if isinstance(p_val, (int, float)):
+                                offset = p_val * current_variation * sample_rng.uniform(-1.0, 1.0)
+                                if isinstance(p_val, int): instance_params[p_name] = max(0, int(round(p_val + offset)))
+                                else: instance_params[p_name] = p_val + offset
+                            else: instance_params[p_name] = p_val
+
+                        # Check Mode & Get Function for Geometric Artifacts
+                        apply_this_artifact = True
+                        target_mask_artifact_func = None
+                        if artifact_name == 'local_elastic':
+                            if geom_mode != 'local_elastic': apply_this_artifact = False
+                            else: target_mask_artifact_func = SHAPE_MASK_ARTIFACT_FUNCS.get(artifact_name)
+                        elif artifact_name == 'local_affine':
+                            if geom_mode != 'local_affine': apply_this_artifact = False
+                            else: target_mask_artifact_func = SHAPE_MASK_ARTIFACT_FUNCS.get(artifact_name)
+                        elif artifact_name in SHAPE_MASK_ARTIFACT_FUNCS:
+                            target_mask_artifact_func = SHAPE_MASK_ARTIFACT_FUNCS.get(artifact_name)
+                        else: apply_this_artifact = False
+                        # --- *** END INSERTED CODE *** ---
+
+                        if apply_this_artifact and target_mask_artifact_func:
+                            try:
+                                actual_mask_instance = target_mask_artifact_func(actual_mask_instance, instance_params, sample_rng)
+                                applied_mask_artifacts_instance.append(artifact_name)
+                            except Exception as e: sample_logger.error(f"Error applying mask artifact {artifact_name} to instance {idx}: {e}", exc_info=True)
+
+                    # 3. Initial Render (using shape params and final mask)
+                    instance_render = np.zeros_like(layer_render_buffer)
+                    # Render the shape *without* intensity first, potentially with AA
+                    # Use original shape_params for rendering geometry
+                    temp_render_geometry = render_shape(shape_type, shape_params, (h, w), intensity=1.0, anti_aliasing=True, rng=sample_rng)
+                    # Apply intensity only where the final *actual* mask is set
+                    instance_render[actual_mask_instance > 0] = temp_render_geometry[actual_mask_instance > 0] * intensity * alpha
+                    instance_render = np.clip(instance_render, 0.0, 1.0)
 
 
-                                # Call render artifact function
-                                if artifact_name == 'shape_border':
-                                    instance_render = target_render_artifact_func(
-                                        instance_render, actual_mask_instance, instance_params, target_intensity, sample_rng
-                                    )
-                                elif artifact_name == 'local_brightness':
-                                     # Use pre-generated noise map if available
-                                     if layer_brightness_noise_map is not None:
-                                         instance_contrast = instance_params.get('contrast', 0.1)
-                                         noise_slice = layer_brightness_noise_map[actual_mask_instance > 0]
-                                         brightness_variation = noise_slice * instance_contrast
-                                         instance_render[actual_mask_instance > 0] *= (1.0 + brightness_variation)
-                                         instance_render = np.clip(instance_render, 0.0, 1.0) # Clip after applying
-                                     else: # Fallback if noise map failed
-                                          sample_logger.warning("Skipping local_brightness due to missing noise map.")
+                    # 4. Apply RENDER-MODIFYING Artifacts
+                    render_artifact_order = ['shape_border', 'local_brightness']
+                    for artifact_name in render_artifact_order:
+                        render_artifact_def = next((a for a in layer_shape_artifacts_defs if a.get('name') == artifact_name), None)
+                        if render_artifact_def:
+                            target_render_artifact_func = SHAPE_RENDER_ARTIFACT_FUNCS.get(artifact_name)
+                            if target_render_artifact_func:
+                                try:
+                                    # *** Re-vary params specific to this render artifact ***
+                                    layer_params_render = render_artifact_def.get('params', {})
+                                    instance_params_render = {}
+                                    variation_factor = 0.2 # Use appropriate variation
+                                    for p_name, p_val in layer_params_render.items():
+                                        if isinstance(p_val, (int, float)):
+                                            offset = p_val * variation_factor * sample_rng.uniform(-1.0, 1.0)
+                                            if isinstance(p_val, int): instance_params_render[p_name] = max(1, int(round(p_val + offset))) # Ensure thickness > 0
+                                            else: instance_params_render[p_name] = p_val + offset
+                                        else: instance_params_render[p_name] = p_val
+                                    # ***
 
-                                applied_render_artifacts_instance.append(artifact_name)
+                                    if artifact_name == 'shape_border':
+                                        instance_render = target_render_artifact_func(instance_render, actual_mask_instance, instance_params, intensity, sample_rng)
+                                    elif artifact_name == 'local_brightness':
+                                        if layer_brightness_noise_map is not None:
+                                            instance_contrast = instance_params.get('contrast', 0.1)
+                                            noise_slice = layer_brightness_noise_map[actual_mask_instance > 0]
+                                            brightness_variation = noise_slice * instance_contrast
+                                            instance_render[actual_mask_instance > 0] *= (1.0 + brightness_variation)
+                                            instance_render = np.clip(instance_render, 0.0, 1.0)
+                                        else: sample_logger.warning("Skipping local_brightness (no noise map).")
+                                    applied_render_artifacts_instance.append(artifact_name)
+                                except Exception as e: sample_logger.error(f"Error applying render artifact {artifact_name} to instance {idx}: {e}", exc_info=True)
 
-                            except Exception as e:
-                                sample_logger.error(f"Error applying render artifact {artifact_name} to instance {idx}: {e}", exc_info=True)
-                        else:
-                            sample_logger.warning(f"Render artifact function '{artifact_name}' not found in map.")
-
-                # 5. Compose instance render onto layer buffer
-                layer_combined_mask_actual |= actual_mask_instance # Update combined mask
-                layer_render_buffer += instance_render # Add final instance render
-                # Track applied artifacts (both mask and render ones for this instance)
-                applied_shape_artifacts_list.extend(applied_mask_artifacts_instance)
-                applied_shape_artifacts_list.extend(applied_render_artifacts_instance)
-
-                num_instances_in_layer += 1
-                # instance_id_counter += 1 # Increment only if needed for per-instance tracking
+                # --- C. Common Instance Processing ---
+                if original_mask_instance is not None and actual_mask_instance is not None and instance_render is not None:
+                    layer_combined_mask_original |= original_mask_instance
+                    layer_combined_mask_actual |= actual_mask_instance
+                    layer_render_buffer += instance_render # Add final instance render
+                    # Track applied artifacts
+                    applied_shape_artifacts_list.extend(applied_mask_artifacts_instance)
+                    applied_shape_artifacts_list.extend(applied_render_artifacts_instance)
+                    num_instances_in_layer += 1
+                # --- End Common Processing ---
 
             print('#######################8##########################')
 
