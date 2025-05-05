@@ -258,10 +258,10 @@ def apply_topographic_shading(image, layers_data, params, rng):
     shading_effect = shading_norm * strength
 
     # Apply shading additively (or multiplicatively?)
-    output_image = image + shading_effect
+    output_image = np.clip(image + shading_effect, 0.0, 1.0)
 
     print(f"Applied topographic shading: strength={strength:.2f}, light_angle={light_angle_deg:.1f}")
-    return np.clip(output_image, 0.0, 1.0)
+    return output_image, height_map
 
 
 def apply_gradient_illumination(image, params, rng):

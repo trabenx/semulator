@@ -1,8 +1,10 @@
 import numpy as np
 import cv2
+import logging
 from skimage.draw import disk, rectangle
 from scipy.ndimage import map_coordinates, binary_erosion
 
+logger = logging.getLogger(__name__)
 
 def apply_edge_ripple(mask, params, rng):
     """Applies ripple to shape edges using contour perturbation."""
@@ -68,50 +70,63 @@ def apply_breaks_holes(mask, params, rng):
     count = params.get('count', 3)
     size_fraction = params.get('size_fraction', 0.1)
     hole_probability = params.get('hole_probability', 0.6)
-    min_defect_size = 3 # Minimum pixels for width/height/radius
+    min_defect_size = 5 # Minimum pixels for width/height/radius
+    
+    # Get mask dimensions needed for boundary checks
+    mask_h, mask_w = mask.shape[:2]
     
     # Find connected components (individual shapes) first
     num_labels, labels_im, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num_labels <= 1: return mask # No foreground components found
+
     output_mask = mask.copy()
 
     # Iterate through each component (shape), skipping background label 0
     for label_id in range(1, num_labels):
-        component_mask = (labels_im == label_id)
-        # Get bounding box from stats
         x, y, w, h, area = stats[label_id]
-        if w < 5 or h < 5 or area < 10:
-            continue # Skip smaller components
+        if w < min_defect_size or h < min_defect_size or area < (min_defect_size*min_defect_size):
+            continue
 
         for _ in range(count):
             # Find a random point *inside* this specific component
             attempts = 0
-            max_attempts = 50 # Increase attempts
+            max_attempts = 50
+            found_point = False
             while attempts < max_attempts:
                 # Choose random point within the bounding box
-                defect_cx = rng.randint(x, x + w)
-                defect_cy = rng.randint(y, y + h)
-                # Check if point is inside the component mask using the labels image
-                if labels_im[defect_cy, defect_cx] == label_id:
-                    break
-                attempts += 1
-            if attempts == max_attempts:
-                # print(f"Warning: Could not find point inside component {label_id} for break/hole.")
-                continue # Failed to find suitable point for this defect
+                defect_cx = rng.randrange(x, x + w) # Generates x <= cx < x + w
+                defect_cy = rng.randrange(y, y + h) # Generates y <= cy < y + h
 
-            # Determine defect size relative to component size
+                # Boundary check (should be redundant now but safe)
+                if 0 <= defect_cy < mask_h and 0 <= defect_cx < mask_w:
+                    # Check if point is inside the *specific component* mask
+                    if labels_im[defect_cy, defect_cx] == label_id:
+                        found_point = True
+                        break # Found a valid point
+                attempts += 1
+
+            if not found_point:
+                # logger.debug(f"Could not find point inside component {label_id} for break/hole after {max_attempts} attempts.")
+                continue # Skip creating defect if no point found
+
+            # Determine defect size
             max_defect_dim = max(min_defect_size, int(min(w, h) * size_fraction))
-            defect_size = rng.randint(min_defect_size, max(min_defect_size + 1, max_defect_dim + 1)) # Ensure range is valid
+            # Ensure upper bound of randint is >= lower bound
+            defect_size = rng.randint(min_defect_size, max(min_defect_size, max_defect_dim)) # Use randint correctly
 
             if rng.random() < hole_probability: # Draw hole (circle)
-                radius = max(min_defect_size // 2, defect_size // 2)
+                radius = max(1, defect_size // 2)
                 cv2.circle(output_mask, (defect_cx, defect_cy), radius, 0, -1)
             else: # Draw break (rectangle)
                 angle = rng.uniform(0, 180)
-                rect_w = max(min_defect_size, defect_size)
-                rect_h = max(min_defect_size, rng.randint(max(1, defect_size//4), max(1, defect_size//2)))
-                rect_w = max(1, rect_w); rect_h = max(1, rect_h)
-                box = cv2.boxPoints(((defect_cx, defect_cy), (rect_w, rect_h), angle))
-                cv2.drawContours(output_mask, [box.astype(int)], 0, 0, -1)
+                rect_w = max(1, defect_size)
+                # Make rectangle slightly elongated
+                rect_h = max(1, rng.randint(max(1, defect_size//3), max(1, defect_size)))
+                try:
+                    box = cv2.boxPoints(((defect_cx, defect_cy), (rect_w, rect_h), angle))
+                    cv2.drawContours(output_mask, [box.astype(int)], 0, 0, -1)
+                except Exception as e: # Catch potential errors in boxPoints/drawContours
+                     logger.warning(f"Error drawing break rectangle: {e}")
 
     return output_mask
 

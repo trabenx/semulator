@@ -189,21 +189,25 @@
     }
   },
   "output_options": {
-    "save_intermediate": true, 
-    "save_masks": true, 
-    "save_visualizations": true, 
+    "save_intermediate": true,
+    "save_masks": true,
+    "save_visualizations": true,
     "save_gifs": true,
     "save_overlays": true,
     "save_metadata": true,
     "save_config": true,
     "save_warp_field": true,
     "save_noise_map": true,
-    "save_hashes": false, 
+    "save_hashes": false,
     "save_defect_masks": true,
-    "save_per_layer_renders": false,
-    "output_formats": { 
-        "final_image": "tif", 
-        "instance_mask": "tif" 
+    "save_per_layer_renders": true,
+    "save_bounding_boxes": true,
+    "save_semantic_map": true,
+    "save_topography_height_map": true,
+    "save_extra_intermediate": true,
+    "output_formats": {
+      "final_image": "tif",
+      "instance_mask": "tif"
     }
   }
 }

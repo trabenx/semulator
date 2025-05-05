@@ -5,68 +5,81 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-def generate_instance_mask(layer_masks, layer_instance_counts):
+def generate_instance_data(layer_masks_actual, layer_instance_start_ids):
      """
-     Generates a combined instance mask from per-layer masks.
-     Assigns unique IDs starting from 1.
+     Generates a combined instance mask and extracts instance metadata.
+
      Args:
-         layer_masks (dict): {layer_idx: actual_mask_for_layer (HxW, uint8)}
-         layer_instance_counts (dict): {layer_idx: num_instances_in_layer}
+         layer_masks_actual (dict): {layer_idx: actual_mask_for_layer (HxW, uint8)}
+         layer_instance_start_ids (dict): {layer_idx: starting_instance_id_for_layer}
+
      Returns:
-         np.ndarray: Instance mask (HxW, uint16 or uint32)
-         dict: Mappings {instance_id: {'layer_idx': L, 'instance_in_layer': I}}
+         tuple: (
+             instance_mask (np.ndarray|None): Instance mask (HxW, uint16/uint32),
+             instance_metadata (dict): {instance_id: {'layer_idx': L, 'bbox': [x,y,w,h], 'centroid': [cx, cy]}}
+         )
      """
-     if not layer_masks:
+     if not layer_masks_actual:
          return None, {}
 
-     # Determine required dtype (uint16 max ~65k instances)
-     total_instances = sum(layer_instance_counts.values())
-     dtype = np.uint16 if total_instances < 65535 else np.uint32
-     if total_instances >= 2**32:
-          logger.warning("Exceeded maximum number of instances for uint32 mask!")
-          # Handle error or clamp? Clamp for now.
-          dtype = np.uint32
-
-
-     first_mask = next(iter(layer_masks.values()))
+     # Combine all actual layer masks into one composite mask first
+     first_mask = next(iter(layer_masks_actual.values()))
      h, w = first_mask.shape
-     instance_mask = np.zeros((h, w), dtype=dtype)
+     composite_actual_mask = np.zeros((h, w), dtype=np.uint8)
+     for layer_idx in sorted(layer_masks_actual.keys()): # Process in order
+         mask = layer_masks_actual[layer_idx]
+         if mask is not None:
+             composite_actual_mask[mask > 0] = 1 # Use 1 temporarily
+
+     # Find connected components in the *final* composite mask
+     # This gives instance IDs corresponding to the final merged shapes
+     num_labels, labels_im, stats, centroids = cv2.connectedComponentsWithStats(
+         composite_actual_mask, connectivity=8, ltype=cv2.CV_32S # Use 32-bit labels
+     )
+
+     # Determine required dtype for final instance mask
+     # num_labels includes background, so max ID is num_labels - 1
+     max_instance_id = num_labels - 1
+     dtype = np.uint16 if max_instance_id < 65535 else np.uint32
+     if max_instance_id == 0: # No instances found
+          logger.warning("No instances found in combined actual mask.")
+          return np.zeros((h, w), dtype=dtype), {}
+     if max_instance_id >= 2**32:
+          logger.warning(f"Exceeded maximum instance ID limit for uint32 ({max_instance_id})!")
+          # Handle error or proceed with clipping (some IDs will be wrong)
+
+     instance_mask = labels_im.astype(dtype) # Convert labeled image to final type
+
+     # --- Extract metadata (bounding box, centroid) ---
      instance_metadata = {}
-     current_instance_id = 1
+     # stats columns: 0:left(x), 1:top(y), 2:width, 3:height, 4:area
+     # centroids columns: 0:x, 1:y
+     for inst_id in range(1, num_labels): # Skip background label 0
+         if inst_id > np.iinfo(dtype).max: continue # Skip if ID exceeds limit
 
-     # Sort layers by index for consistent ID assignment
-     sorted_layer_indices = sorted(layer_masks.keys())
+         x, y, w_box, h_box, area = stats[inst_id]
+         cx, cy = centroids[inst_id]
 
-     for layer_idx in sorted_layer_indices:
-         layer_mask = layer_masks[layer_idx]
-         num_instances = layer_instance_counts[layer_idx]
+         # Determine which original layer this instance *primarily* belongs to
+         # (Approximate by checking centroid or majority overlap - centroid is simpler)
+         layer_idx_assigned = -1 # Default if no layer match
+         int_cx, int_cy = int(round(cx)), int(round(cy))
+         # Check centroid location against original layer masks in reverse order (top layers first)
+         for layer_idx in sorted(layer_masks_actual.keys(), reverse=True):
+              if 0 <= int_cy < h and 0 <= int_cx < w: # Ensure centroid is within bounds
+                   if layer_masks_actual[layer_idx][int_cy, int_cx] > 0:
+                       layer_idx_assigned = layer_idx
+                       break # Assign to the first (topmost) layer found
 
-         # Find connected components in the layer mask
-         # connectivity=8 means pixels are connected if they touch at edges or corners
-         num_labels, labels_im = cv2.connectedComponents(layer_mask, connectivity=8)
+         instance_metadata[int(inst_id)] = { # Ensure key is standard int
+             'layer_idx': layer_idx_assigned, # Layer it likely originated from
+             'bbox_xywh': [int(x), int(y), int(w_box), int(h_box)],
+             'centroid_xy': [float(cx), float(cy)]
+         }
 
-         # num_labels includes the background (0), so iterate from 1 up to num_labels-1
-         instance_in_layer_idx = 0
-         for label_id in range(1, num_labels):
-              if current_instance_id > np.iinfo(dtype).max:
-                  logger.error("Instance ID exceeds dtype limit. Stopping assignment.")
-                  break
-
-              component_mask = (labels_im == label_id)
-              # Assign unique ID, only where not already assigned by previous layers
-              instance_mask[component_mask & (instance_mask == 0)] = current_instance_id
-
-              instance_metadata[current_instance_id] = {
-                  'layer_idx': layer_idx,
-                  'instance_in_layer': instance_in_layer_idx
-              }
-              current_instance_id += 1
-              instance_in_layer_idx += 1
-
-         if current_instance_id > np.iinfo(dtype).max: break # Break outer loop too
-
-     logger.info(f"Generated instance mask with {current_instance_id - 1} instances.")
+     logger.info(f"Generated instance data with {max_instance_id} instances.")
      return instance_mask, instance_metadata
+
 
 
 def generate_combined_mask(layer_masks, mask_type='actual'):

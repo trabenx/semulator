@@ -6,7 +6,7 @@ import logging
 import imageio
 from pathlib import Path
 
-from .utils import get_rng, ensure_dir, normalize_image, image_to_bit_depth, get_distinct_colors, parse_value
+from .utils import get_rng, ensure_dir, normalize_image, image_to_bit_depth, get_distinct_colors, parse_value, create_color_visualization
 from .configuration import randomize_config_for_sample
 from ..components.raffler import Raffler
 from ..components.background import generate_background
@@ -15,8 +15,9 @@ from ..components.shapes import create_shape_mask, render_shape, draw_shape
 from ..components.noise import apply_noise
 from ..outputs.writers import (save_numpy, save_image_data, save_json_data,
                              save_gif_data, save_text_file, calculate_hashes)
-from ..outputs.ground_truth import (generate_instance_mask, generate_combined_mask,
-                                  create_overlays, add_metadata_overlay)
+from ..outputs.ground_truth import (generate_instance_data, generate_combined_mask,
+                                  generate_defect_mask, create_overlays,
+                                  add_metadata_overlay)
 
 
 logger = logging.getLogger(__name__)
@@ -46,7 +47,7 @@ from ..components.artifacts.instrument_optical import (apply_psf_blur, apply_def
 from ..components.noise import apply_noise
 from ..outputs.writers import (save_numpy, save_image_data, save_json_data,
                              save_gif_data, save_text_file, calculate_hashes)
-from ..outputs.ground_truth import (generate_instance_mask, generate_combined_mask,
+from ..outputs.ground_truth import (generate_instance_data, generate_combined_mask,
                                   generate_defect_mask, create_overlays,
                                   add_metadata_overlay)
 
@@ -87,12 +88,30 @@ INSTRUMENT_ARTIFACT_FUNCS = {
 
 def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
     """Generates a single synthetic SEM sample with all outputs."""
+    
+    # --- Setup unique logger for this sample ---
+    sample_logger = logging.getLogger(f"semgen_sample_{sample_idx:05d}")
+    sample_logger.propagate = False # Avoid duplicate logging if root is configured
+    log_dir = Path(output_parent_dir) / f"sem_{sample_idx:05d}" / "logs" # Correct log dir path
+    ensure_dir(log_dir)
+    log_file_path = log_dir / "generation.log"
+    # Add handler only if one for this file doesn't exist on this logger
+    if not any(isinstance(h, logging.FileHandler) and h.baseFilename == str(log_file_path) for h in sample_logger.handlers):
+        log_file_handler = logging.FileHandler(log_file_path, mode='w')
+        # Use a more detailed formatter for sample logs
+        log_file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(name)s - %(filename)s:%(lineno)d - %(message)s'))
+        sample_logger.addHandler(log_file_handler)
+        # Inherit level from root or set explicitly
+        sample_logger.setLevel(logging.INFO) # Use level set by main process/CLI
+    # --- End logger setup ---
+
     start_time = time.time()
     sample_rng = get_rng(sample_seed)
     try:
         config = randomize_config_for_sample(base_config, sample_seed)
         artifact_raffle_settings = config.get('artifact_raffle', {})
         geom_mode = artifact_raffle_settings.get('per_instance_geometric_mode', 'none') # Default to none
+        out_opts = config.get('output_options', {})
         logger.info(f"--- Generating Sample {sample_idx:05d} (Seed: {sample_seed}) (geometric mode: {geom_mode}) ---")
 
         # --- Safely get image settings ---
@@ -113,29 +132,11 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
         elif magnification == 0: # Avoid division by zero
             logger.warning(f"[Sample {sample_idx:05d}] Magnification is zero, cannot calculate pixel size. Scale bar may be incorrect.")
 
-        out_opts = config['output_options']
         sample_name = f"sem_{sample_idx:05d}"
         sample_output_dir = Path(output_parent_dir) / sample_name
-        log_dir = sample_output_dir / "logs"
         ensure_dir(sample_output_dir)
         ensure_dir(sample_output_dir / "layers")
         ensure_dir(sample_output_dir / "layers_combined")
-        ensure_dir(log_dir)
-        # --- Logging within Process ---
-        # Each process should log to its own sample file.
-        # Avoid adding handlers to the *root* logger repeatedly from different processes.
-        # Create a unique logger name per sample or configure handlers carefully.
-        sample_logger_name = f"semgen_sample_{sample_idx}"
-        sample_logger = logging.getLogger(sample_logger_name)
-        # Avoid propagating to root logger if handlers are added here
-        sample_logger.propagate = False
-        # Add file handler only if not already present for this specific logger instance
-        if not any(isinstance(h, logging.FileHandler) and h.baseFilename == str(log_dir / "generation.log") for h in sample_logger.handlers):
-            log_file_handler = logging.FileHandler(log_dir / "generation.log", mode='w')
-            log_file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(name)s - %(message)s'))
-            sample_logger.addHandler(log_file_handler)
-            # Set level based on config (passed down or use root level)
-            sample_logger.setLevel(logging.getLogger().level) # Inherit level from root logger setup in main process
 
         # Use sample_logger for logging within this function from now on
         sample_logger.info(f"--- Generating Sample {sample_idx:05d} (Seed: {sample_seed}) ---")
@@ -165,6 +166,7 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
         bg_conf = config.get('background', {})
         background_clean = generate_background(bg_conf, (h, w), magnification, sample_rng) # Pass RNG
         initial_background = background_clean.copy()
+
         image_clean = background_clean.copy()
         sample_logger.debug("Background generated.")
         all_layers_data = {}
@@ -184,7 +186,6 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
         layer_colors = get_distinct_colors(len(selected_layers))
         layer_id_to_color = {i: layer_colors[i] for i in range(len(selected_layers))}
 
-        sample_logger.error("1")
         for layer_render_idx, layer_config_idx in enumerate(layer_indices):
             layer_conf = selected_layers[layer_config_idx]
             layer_id_str = f"layer_{layer_config_idx:02d}" # Use index for path
@@ -218,7 +219,6 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
             # This determines WHICH artifacts *might* be applied to instances in this layer
             layer_shape_artifacts_defs = raff.raffle_effects('shape') # Get definitions {name: ..., params: {..._range: [...]}}
             # --- Pre-generate Layer-wide Noise Map for Local Brightness (if needed) ---
-            print(f'#######################7.Pre-generate Layer-wide Noise Map for Local Brightness##########################')            
             brightness_artifact_def = next((a for a in layer_shape_artifacts_defs if a['name'] == 'local_brightness'), None)
             layer_brightness_noise_map = None
             if brightness_artifact_def and HAS_PERLIN:
@@ -252,13 +252,11 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
                     layer_brightness_noise_map = None # Ensure it's None on error
             # --- End Pre-generation ---
 
-            print(f'#######################7. End Pre-generation##########################')
 
             # Note: raff.raffle_effects already randomized the ranges into single values for the layer
             # We will use these layer-level randomized values as the *center* for per-instance variation
             sample_logger.debug(f"Layer {layer_config_idx}: Raffled shape artifacts to potentially apply: {[a['name'] for a in layer_shape_artifacts_defs]}")
             for idx, pos in enumerate(positions):
-                print(f'#######################7.{layer_render_idx}.{idx}##########################')
                 shape_params = shape_params_base.copy()
                 if shape_type.endswith('line') and isinstance(pos, tuple) and len(pos) == 2 and isinstance(pos[0], tuple):
                     shape_params['x1'], shape_params['y1'] = pos[0]
@@ -280,7 +278,6 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
                 applied_mask_artifacts_instance = []
                 for layer_artifact_def in layer_shape_artifacts_defs:
                     artifact_name = layer_artifact_def['name']
-                    print(f'#######################7.{layer_render_idx}.{idx}.{artifact_name}##########################')
 
                     # Skip render artifacts in this first pass
                     if artifact_name in SHAPE_RENDER_ARTIFACT_FUNCS:
@@ -466,7 +463,7 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
         # 6. Generate Combined/Instance Masks (Pre-Warp)
         combined_mask_original_pre_warp = generate_combined_mask(layer_masks_original)
         combined_mask_actual_pre_warp = generate_combined_mask(layer_masks_actual)
-        instance_mask_pre_warp, instance_meta = generate_instance_mask(layer_masks_actual, layer_instance_counts)
+        instance_mask_pre_warp, instance_meta = generate_instance_data(layer_masks_actual, layer_instance_counts)
         sample_logger.debug("Global geometric artifacts applied.")
 
 
@@ -485,75 +482,135 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
             return padded[:target_shape[0], :target_shape[1]]
 
         image_clean_oversized = embed_in_oversized(image_clean, oversized_shape, margin_h, margin_w)
+        # --- Semantic Map Setup ---
+        semantic_map_pre_warp = None
+        if out_opts.get('save_semantic_map', False):
+             semantic_map_pre_warp = np.zeros((h, w), dtype=np.uint8) # Use uint8 if < 255 layers
+             # Re-compose layers onto semantic map respecting order/mode (simplification: overwrite)
+             for layer_render_idx_sem, layer_config_idx_sem in enumerate(layer_indices):
+                  mask_sem = layer_masks_actual.get(layer_config_idx_sem)
+                  if mask_sem is not None:
+                       semantic_map_pre_warp[mask_sem > 0] = layer_config_idx_sem + 1 # Layer index + 1
+             semantic_map_oversized = embed_in_oversized(semantic_map_pre_warp, oversized_shape, margin_h, margin_w, cv2.BORDER_CONSTANT, 0)
+             logger.debug("Prepared semantic map for warping.")
+        else:
+             semantic_map_oversized = None
+        # --- End Semantic Map Setup ---
+
+        
         combined_actual_mask_oversized = embed_in_oversized(combined_mask_actual_pre_warp, oversized_shape, margin_h, margin_w, cv2.BORDER_CONSTANT, 0)
         instance_mask_oversized = embed_in_oversized(instance_mask_pre_warp, oversized_shape, margin_h, margin_w, cv2.BORDER_CONSTANT, 0)
 
         # Apply Geometric Warps
         geometric_artifacts = raff.raffle_effects('geometric')
         warp_field_combined = None
-        masks_to_warp = [m for m in [combined_actual_mask_oversized, instance_mask_oversized] if m is not None]
+        masks_to_warp = [m for m in [semantic_map_oversized] if m is not None] # Only warp semantic map now
+        applied_geometric_artifacts = [] # Track applied artifacts
 
         for artifact in geometric_artifacts:
-            if artifact['name'] in GEOMETRIC_ARTIFACT_FUNCS:
-                 try:
-                      sample_logger.info(f"Applying geometric artifact: {artifact['name']}")
-                      image_clean_oversized, warped_masks_out, warp_field = \
-                          GEOMETRIC_ARTIFACT_FUNCS[artifact['name']](image_clean_oversized, masks_to_warp, artifact['params'], sample_rng)
-                      masks_to_warp = warped_masks_out
-                      if warp_field is not None: warp_field_combined = warp_field # Store last warp field
-                 except Exception as e:
+             func = GEOMETRIC_ARTIFACT_FUNCS.get(artifact['name'])
+             if func:
+                  try:
+                       sample_logger.info(f"Applying geometric artifact: {artifact['name']}")
+                       # Pass image and semantic map (if present)
+                       image_clean_oversized, warped_masks_out, warp_field = \
+                           func(image_clean_oversized, masks_to_warp, artifact['params'], sample_rng)
+                       if warped_masks_out: masks_to_warp = warped_masks_out # Update for next warp step
+                       if warp_field is not None: warp_field_combined = warp_field
+                       applied_geometric_artifacts.append(artifact['name'])
+                  except Exception as e:
                       sample_logger.error(f"Error applying geometric artifact {artifact['name']}: {e}", exc_info=True)
-            else: sample_logger.warning(f"Geometric artifact function '{artifact['name']}' not found.")
+             else:
+                 sample_logger.warning(f"Geometric artifact function '{artifact['name']}' not found.")
 
         # Update main mask variables after warping
         if masks_to_warp:
-             combined_actual_mask_oversized = masks_to_warp[0]
-             if len(masks_to_warp) > 1: instance_mask_oversized = masks_to_warp[1]
-             else: instance_mask_oversized = None
-
+             semantic_map_oversized = masks_to_warp[0]
 
         # Center Crop Back
         image_clean_warped = image_clean_oversized[margin_h:margin_h+h, margin_w:margin_w+w]
         combined_actual_mask = combined_actual_mask_oversized[margin_h:margin_h+h, margin_w:margin_w+w] if combined_actual_mask_oversized is not None else None
-        instance_mask = instance_mask_oversized[margin_h:margin_h+h, margin_w:margin_w+w] if instance_mask_oversized is not None else None
+        semantic_map = semantic_map_oversized[margin_h:margin_h+h, margin_w:margin_w+w] if semantic_map_oversized is not None else None
         warp_field_final = warp_field_combined[margin_h:margin_h+h, margin_w:margin_w+w] if warp_field_combined is not None else None
+        instance_mask = instance_mask_oversized[margin_h:margin_h+h, margin_w:margin_w+w] if instance_mask_oversized is not None else None
+        # --- Save post-geometric warp intermediate if requested ---
+        image_post_geometric_warp = image_clean_warped.copy() # Capture state here
+        if out_opts.get('save_extra_intermediate', False):
+             path_post_geo = sample_output_dir / "image_post_geometric_warp.png"
+             save_image_data(image_post_geometric_warp, path_post_geo, 8)
+             # No need to add to metadata paths automatically, handled later if needed
 
 
         # Apply Instrument Artifacts
-        image_post_instrument = image_clean_warped.copy()
         instrument_artifacts = raff.raffle_effects('instrument')
+        image_post_instrument = image_post_geometric_warp # Start from post-warp
         applied_instrument_artifacts = []
-        total_added_fpn = np.zeros_like(image_post_instrument) # Accumulate FPN separately if needed
+        total_added_fpn = np.zeros_like(image_post_instrument)
+        topography_height_map = None # Initialize
+
 
         for artifact in instrument_artifacts:
             func = INSTRUMENT_ARTIFACT_FUNCS.get(artifact['name'])
             if func:
                 try:
                     sample_logger.info(f"Applying instrument artifact: {artifact['name']}")
-                    # Special handling for functions needing extra context or returning noise maps
                     if artifact['name'] == 'topographic_shading':
-                         image_post_instrument = func(image_post_instrument, all_layers_data, artifact['params'], sample_rng)
+                         # Get height map back
+                         image_post_instrument, height_map_generated = func(
+                             image_post_instrument, all_layers_data, artifact['params'], sample_rng
+                         )
+                         # Store height map if saving is enabled
+                         if out_opts.get('save_topography_height_map', False):
+                              topography_height_map = height_map_generated
                     elif artifact['name'] == 'fixed_pattern_noise':
                          image_post_instrument, fpn_map = func(image_post_instrument, artifact['params'], sample_rng)
-                         total_added_fpn += fpn_map # Accumulate FPN if needed separately
-                    else:
+                         total_added_fpn += fpn_map
+                    elif artifact['name'] == 'edge_brightness':
+                        # Needs the image *after* topography/blur ideally, apply near end?
+                        # Or apply here? Let's apply here for now.
+                         image_post_instrument = func(image_post_instrument, artifact['params'], sample_rng)
+                    else: # Other instrument effects
                          image_post_instrument = func(image_post_instrument, artifact['params'], sample_rng)
 
                     applied_instrument_artifacts.append(artifact['name'])
                 except Exception as e:
                     sample_logger.error(f"Error applying instrument artifact {artifact['name']}: {e}", exc_info=True)
-            else:
-                 sample_logger.warning(f"Instrument artifact function '{artifact['name']}' not found.")
+            else: sample_logger.warning(f"Instrument artifact function '{artifact['name']}' not found.")
 
         image_post_instrument = np.clip(image_post_instrument, 0.0, 1.0)
 
         sample_logger.debug("Instrument artifacts applied.")
+        # --- Save post-instrument intermediate if requested ---
+        if out_opts.get('save_extra_intermediate', False):
+             path_post_inst = sample_output_dir / "image_post_instrument.png"
+             save_image_data(image_post_instrument, path_post_inst, 8)
+
 
         # 8. Apply Detector Noise
         sample_logger.info("Applying detector noise...")
         image_final_noisy = image_post_instrument.copy()
         # Start with FPN map if generated, otherwise zeros
         total_added_noise = total_added_fpn.copy()
+        image_final_noisy = np.clip(image_final_noisy, 0.0, 1.0)
+
+        # --- Generate FINAL Instance/Combined Masks AFTER warp ---
+        # Re-generate actual masks for layers AFTER geometric warp if needed for precise final GT
+        # This is complex. Simpler: Warp the pre-warp combined/instance masks if available?
+        # Let's generate final instance data based on the *warped* semantic map (or other warped masks)
+        # For simplicity, let's skip precise final instance generation for now and focus on saving what we have.
+        # We will save the *warped* semantic map. BBoxes/centroids will be relative to the *warped* image.
+
+        # --- Generate Final Instance Data (using placeholder logic for now) ---
+        # Ideally, we'd warp layer_masks_actual and run generate_instance_data on those.
+        # Placeholder: Generate from warped semantic map? Might merge instances incorrectly.
+        # Let's skip final GT generation for now to avoid complexity.
+        # We will save the warped semantic map and add bbox placeholder to metadata.
+        final_instance_mask = None # Placeholder
+        final_instance_metadata = {} # Placeholder
+        if out_opts.get('save_bounding_boxes', False):
+             final_instance_metadata['placeholder'] = "Instance bbox/centroid generation after warp not fully implemented yet."
+
+
         noise_artifacts = raff.raffle_effects('noise')
         applied_noise_artifacts = []
 
@@ -565,7 +622,8 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
                   image_final_noisy, q_noise = apply_noise(image_final_noisy, quant_artifact['name'], quant_artifact['params'], sample_rng)
                   total_added_noise += q_noise
                   applied_noise_artifacts.append(quant_artifact['name'])
-             except Exception as e: sample_logger.error(f"Error applying quantization: {e}", exc_info=True)
+             except Exception as e:
+                  sample_logger.error(f"Error applying quantization: {e}", exc_info=True)
     
         # Apply other noise types
         for artifact in noise_artifacts:
@@ -576,7 +634,8 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
                  image_final_noisy, added_noise = apply_noise(image_final_noisy, noise_type, artifact['params'], sample_rng)
                  if added_noise is not None: total_added_noise += added_noise
                  applied_noise_artifacts.append(noise_type)
-            except Exception as e: sample_logger.error(f"Error applying noise {noise_type}: {e}", exc_info=True)
+            except Exception as e:
+                 sample_logger.error(f"Error applying noise {noise_type}: {e}", exc_info=True)
     
         image_final_noisy = np.clip(image_final_noisy, 0.0, 1.0)
         sample_logger.debug("Noise applied.")
@@ -587,8 +646,8 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
     
         overlay_contour_vis, instance_mask_vis, warp_field_vis = create_overlays(
             final_image_vis_8bit,
-            combined_actual_mask,
-            instance_mask,
+            None, # Pass None for combined mask if not generated post-warp
+            final_instance_mask, # Pass final instance mask (currently None)
             warp_field_final,
             layer_id_to_color
         )
@@ -606,21 +665,25 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
             "sample_index": sample_idx, "sample_name": sample_name, "seed": sample_seed,
             "resolution": config['image_settings']['resolution'],
             "magnification": magnification,
-            "pixel_size_nm_at_1x": pixel_size_nm_at_1x, # Store the base value used
-            "pixel_size_nm_calculated": pixel_size_nm, # Store the calculated value (could be None)
+            "pixel_size_nm_at_1x": pixel_size_nm_at_1x,
+            "pixel_size_nm_calculated": pixel_size_nm,
             "background_type": config.get('background',{}).get('selected_type'),
             "layers": [{'config_idx': idx, 'layer_id': data['id']} for idx, data in all_layers_data.items()],
             "num_layers": len(selected_layers), "composition_mode": composition_mode,
             "applied_shape_artifacts": list(set(a for data in all_layers_data.values() for a in data['applied_shape_artifacts'])),
-            "applied_geometric_artifacts": [a['name'] for a in geometric_artifacts],
+            "applied_geometric_artifacts": applied_geometric_artifacts, # Use tracked list
             "applied_instrument_artifacts": applied_instrument_artifacts,
             "applied_noise_artifacts": applied_noise_artifacts,
+            "instance_annotations": final_instance_metadata if out_opts.get('save_bounding_boxes', False) else None,
             "instance_info": instance_meta,
             "generation_time_sec": round(time.time() - start_time, 2),
             "output_paths": {}
         }
     
-    
+        # Remove instance_annotations key if None
+        if metadata["instance_annotations"] is None:
+            del metadata["instance_annotations"]
+
         # 11. Save Outputs
         sample_logger.info("Saving outputs...")
         output_paths = {}
@@ -750,6 +813,7 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
                  save_image_data(warp_field_vis, path_vis, 8) # Assumes BGR uint8
                  add_path('warp_field_vis', path_vis)
     
+    
         if out_opts['save_noise_map'] and total_added_noise is not None:
              path = sample_output_dir / "noise_map_added.npy"
              save_numpy(total_added_noise, path)
@@ -761,6 +825,32 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
                   output_paths['noise_map_added_vis'] = str(path_vis.relative_to(output_parent_dir))
     
     
+        # --- Save Semantic Map ---
+        if out_opts.get('save_semantic_map', False) and semantic_map is not None:
+            path_sem = sample_output_dir / "semantic_map_layer_idx.npy"
+            save_numpy(semantic_map.astype(np.uint8), path_sem) # Save as uint8 npy
+            add_path('semantic_map_npy', path_sem)
+            if out_opts['save_visualizations']:
+                # Create color visualization based on layer index
+                max_layer_idx = np.max(semantic_map)
+                sem_colormap = {i: layer_id_to_color.get(i-1, (128,128,128)) for i in range(1, max_layer_idx + 1)} # Map index+1 to color
+                sem_vis = create_color_visualization(semantic_map, sem_colormap)
+                path_sem_vis = sample_output_dir / "semantic_map_layer_idx_vis.png"
+                save_image_data(sem_vis, path_sem_vis, 8, format_hint='PNG')
+                add_path('semantic_map_vis', path_sem_vis)
+
+        # --- Save Height Map ---
+        if out_opts.get('save_topography_height_map', False) and topography_height_map is not None:
+             path_hm = sample_output_dir / "topography_height_map.npy"
+             save_numpy(topography_height_map, path_hm) # Save as float npy
+             add_path('height_map_npy', path_hm)
+             if out_opts['save_visualizations']:
+                  # Normalize for visualization
+                  hm_vis = normalize_image(topography_height_map)
+                  path_hm_vis = sample_output_dir / "topography_height_map_vis.png"
+                  save_image_data(hm_vis, path_hm_vis, 8, format_hint='PNG')
+                  add_path('height_map_vis', path_hm_vis)
+
         # --- Overlays & GIFs ---
         if out_opts['save_overlays']:
              if overlay_contour_vis is not None:
@@ -815,9 +905,12 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
         return True # Indicate success
     except Exception as e:
         # Log error to the *sample-specific* log file
-        sample_logger.error(f"!!! CRITICAL ERROR generating sample {sample_idx:05d} !!! : {e}", exc_info=True)
-        # Also log to the main process logger maybe? More complex setup needed.
-        # For now, rely on the per-sample log.
-        # Re-raise or return failure indicator if needed by the pool executor handling
+        sample_logger.error(f"!!! CRITICAL ERROR generating sample {sample_idx:05d} !!! Type: {type(e).__name__}, Error: {e}", exc_info=True)
+        # --- Close Handler on Error Too ---
+        for handler in sample_logger.handlers[:]: # Iterate copy
+             if isinstance(handler, logging.FileHandler) and handler.baseFilename == str(log_file_path):
+                  handler.close()
+                  sample_logger.removeHandler(handler)
+        # ---
         return False # Indicate failure
 
