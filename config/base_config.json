@@ -235,6 +235,9 @@
     "save_semantic_map": true,
     "save_topography_height_map": true,
     "save_extra_intermediate": true,
+    "save_layer_order_map": true,
+    "save_clean_layer_renders": true,
+    "include_artifact_params_in_metadata": true,
     "output_formats": {
       "final_image": "tif",
       "instance_mask": "tif"

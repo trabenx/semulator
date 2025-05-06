@@ -18,10 +18,22 @@ def save_numpy(array, path):
         logger.error(f"Failed to save NumPy array {path}: {e}", exc_info=True) # Add exc_info
 
 def save_image_data(image_data, path, bit_depth=16, format_hint=None):
-     """Saves image data (float 0-1) to file (TIF/PNG)."""
+     """Saves image data (handles float or integer) to file (TIF/PNG)."""
      # Ensure path is a Path object
      path = Path(path)
-     ensure_dir(path.parent)
+     ensure_dir(path.parent) # Ensure directory first
+
+     # --- Input Data Checks ---
+     if image_data is None:
+         logger.error(f"Cannot save image to {path}: Input data is None.")
+         return False # Indicate failure
+     if not isinstance(image_data, np.ndarray):
+         try: image_data = np.array(image_data)
+         except Exception as e_conv: logger.error(f"Failed to convert input to NumPy array for {path}: {e_conv}"); return False
+     if not np.all(np.isfinite(image_data)):
+          logger.warning(f"Non-finite values (NaN/inf) found in image data for {path}. Clamping.")
+          image_data = np.nan_to_num(image_data, nan=0.0, posinf=1.0, neginf=0.0) # Clamp/replace bad values
+     # ---
 
      # Determine format from extension or hint
      file_ext = path.suffix.lower()
@@ -34,36 +46,61 @@ def save_image_data(image_data, path, bit_depth=16, format_hint=None):
          else:
              logger.warning(f"Cannot determine image format for {path}, defaulting to PNG.")
              fmt = 'PNG'
-             path = path.with_suffix('.png') # Ensure correct extension
+         path = path.with_suffix(f'.{fmt.lower()}')
 
      try:
-        # Convert normalized float (0-1) to target bit depth
-        # Ensure input is numpy array before conversion
-        if not isinstance(image_data, np.ndarray):
-             image_data = np.array(image_data)
+         image_typed = None
+         save_dtype_log = "" # For logging
 
-        image_typed = image_to_bit_depth(image_data, bit_depth)
+         # --- Prepare data for saving ---
+         if np.issubdtype(image_data.dtype, np.integer):
+              # Integer data (e.g., masks) - save directly
+              image_typed = image_data
+              save_dtype_log = f"integer data as is ({image_typed.dtype})"
+              # Infer bit depth for logging consistency
+              if image_typed.dtype == np.uint8: bit_depth = 8
+              elif image_typed.dtype == np.uint16: bit_depth = 16
+              elif image_typed.dtype == np.uint32: bit_depth = 32
+         elif np.issubdtype(image_data.dtype, np.floating):
+              # Float data - normalize [0,1] then convert to target bit depth
+              save_dtype_log = f"float data to {bit_depth}-bit"
+              # Ensure data is clipped 0-1 before conversion
+              image_clipped = np.clip(image_data, 0.0, 1.0)
+              image_typed = image_to_bit_depth(image_clipped, bit_depth)
+         else:
+              # Other types - attempt conversion? Log warning.
+              logger.warning(f"Unexpected image data type {image_data.dtype} for {path}. Attempting conversion to {bit_depth}-bit.")
+              try: # Try normalizing assuming it's numeric-like
+                  image_normalized = normalize_image(image_data.astype(float))
+                  image_typed = image_to_bit_depth(image_normalized, bit_depth)
+                  save_dtype_log = f"unexpected type to {bit_depth}-bit"
+              except Exception as e_conv_other:
+                   logger.error(f"Cannot convert dtype {image_data.dtype} for saving {path}: {e_conv_other}")
+                   return False # Indicate failure
 
-        if fmt == 'TIFF':
-            try:
-                # Try tifffile explicitly first
-                imageio.v3.imwrite(path, image_typed, plugin='tifffile')
-                logger.debug(f"Saved {bit_depth}-bit image (TIFF via tifffile): {path}")
-            except Exception as e_tf:
-                logger.warning(f"Saving TIFF with tifffile failed ({e_tf}), trying default...")
-                # Fallback to default imageio handling if tifffile fails
-                imageio.imwrite(path, image_typed, format='TIFF')
-                logger.debug(f"Saved {bit_depth}-bit image (TIFF via default): {path}")
-        elif fmt == 'PNG':
-            imageio.imwrite(path, image_typed, format='PNG')
-            logger.debug(f"Saved {bit_depth}-bit image (PNG via default): {path}")
+         if image_typed is None:
+             logger.error(f"Failed to prepare typed image data for saving {path}.")
+             return False
 
-     except FileNotFoundError:
-          logger.error(f"Failed to save image {path}: File path seems invalid or inaccessible.")
-     except ImportError:
-          logger.error(f"Failed to save image {path}: imageio backend for {fmt} might be missing.")
+         # --- Save using simple imageio call ---
+         logger.debug(f"Saving {save_dtype_log} to {path} (Format: {fmt}, Dtype: {image_typed.dtype})")
+         imageio.imwrite(path, image_typed, format=fmt)
+         logger.debug(f"imageio.imwrite call completed for {path}.")
+
+         # --- Verify Save ---
+         # Short delay might help filesystem cache flushing on some systems
+         import time
+         time.sleep(0.05)
+         if not path.is_file():
+             logger.error(f"File verification FAILED after saving {path}. Check permissions/disk space.")
+             return False # Indicate failure
+
+         logger.info(f"Successfully saved {path}")
+         return True # Indicate success
+
      except Exception as e:
-          logger.error(f"Failed to save image {path}: {e}", exc_info=True) # Add exc_info
+          logger.error(f"!!! EXCEPTION during save_image_data for {path}: {e}", exc_info=True)
+          return False # Indicate failure
 
 
 def save_json_data(data, path):
