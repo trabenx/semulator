@@ -2,12 +2,16 @@ import numpy as np
 import random
 from ..core.utils import get_rng
 # from skimage.util import random_noise # Can use this too
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Need HAS_PERLIN check here too
 try:
     from perlin_noise import PerlinNoise
     HAS_PERLIN = True
 except ImportError:
+    logger.warning("Warning: Perlin noise library not found. Skipping SEM texture noise.")
     HAS_PERLIN = False
 
 def add_gaussian_noise(image, params, rng):
@@ -17,7 +21,7 @@ def add_gaussian_noise(image, params, rng):
     np_rng = np.random.RandomState(rng.randint(0, 2**32 - 1))
     noise = np_rng.normal(0, sigma, image.shape).astype(np.float32)
     noisy_image = image + noise
-    print(f"Added Gaussian noise: sigma={sigma:.3f}")
+    logger.debug(f"Added Gaussian noise: sigma={sigma:.3f}")
     return noisy_image, noise
 
 def add_poisson_noise(image, params, rng):
@@ -28,7 +32,7 @@ def add_poisson_noise(image, params, rng):
     np_rng = np.random.RandomState(rng.randint(0, 2**32 - 1))
     noise = np_rng.normal(0, 1, image.shape).astype(np.float32) * sigma # Apply spatially varying sigma
     noisy_image = image + noise
-    print(f"Added Poisson-like noise (scale={scale:.2f})")
+    logger.debug(f"Added Poisson-like noise (scale={scale:.2f})")
     return noisy_image, noise
 
 def add_salt_pepper_noise(image, params, rng):
@@ -55,7 +59,7 @@ def add_salt_pepper_noise(image, params, rng):
     noisy_image[coords] = pepper_val
     noise_map[coords] += delta_pepper
 
-    print(f"Added Salt & Pepper noise: prob={prob:.4f}")
+    logger.debug(f"Added Salt & Pepper noise: prob={prob:.4f}")
     return noisy_image, noise_map
 
 
@@ -63,7 +67,7 @@ def add_sem_texture_noise(image, params, rng):
      """Adds procedural texture noise (e.g., Perlin), potentially anisotropic."""
      # Requires Perlin noise implementation (from library or manual)
      if not HAS_PERLIN: # Check if Perlin is available (from background.py import)
-         print("Warning: Perlin noise library not found. Skipping SEM texture noise.")
+         logger.warning("Warning: Perlin noise library not found. Skipping SEM texture noise.")
          return image, np.zeros_like(image)
 
      scale = params.get('scale', 30.0)
@@ -88,7 +92,7 @@ def add_sem_texture_noise(image, params, rng):
      texture_noise = texture * contrast
 
      noisy_image = image + texture_noise
-     print(f"Added SEM texture noise: scale={scale:.1f}, contrast={contrast:.3f}, anisotropy={anisotropy:.2f}")
+     logger.debug(f"Added SEM texture noise: scale={scale:.1f}, contrast={contrast:.3f}, anisotropy={anisotropy:.2f}")
      return noisy_image, texture_noise
 
 def apply_quantization(image, params, rng):
@@ -100,7 +104,7 @@ def apply_quantization(image, params, rng):
     quantized_image = np.round(np.clip(image, 0.0, 1.0) * (num_levels - 1)) / (num_levels - 1)
     added_noise = quantized_image - image # The quantization error
 
-    print(f"Applied quantization to {target_bits} bits.")
+    logger.debug(f"Applied quantization to {target_bits} bits.")
     return quantized_image, added_noise
 
 
@@ -114,7 +118,7 @@ def apply_blur_noise(image, params, rng):
      # Noise map here represents the difference (signal removed by blur)
      added_noise = blurred_image - image
 
-     print(f"Applied blur noise: sigma={sigma:.2f}")
+     logger.debug(f"Applied blur noise: sigma={sigma:.2f}")
      return blurred_image, added_noise
 
 
@@ -145,5 +149,5 @@ def apply_noise(image, noise_type, params, rng):
     # elif noise_type == 'fixed_pattern': -> Handled in instrument stage
     #     return add_fixed_pattern_noise(image, params, rng)
     else:
-        print(f"Warning: Noise type '{noise_type}' not implemented.")
+        logger.warning(f"Warning: Noise type '{noise_type}' not implemented.")
         return image, np.zeros_like(image) # Return unchanged image and zero noise map

@@ -742,7 +742,7 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
         
         save_success = save_image_data(image_final_noisy, final_img_path, bit_depth, format_hint=final_image_format.upper())
         if save_success:
-             sample_logger.info(f"Successfully saved final image: {final_img_path}")
+             sample_logger.debug(f"Successfully saved final image: {final_img_path}")
              add_path('final_image', final_img_path)
         else:
              sample_logger.error(f"!!! Failed to save final image file at: {final_img_path} (see writer logs) !!!")

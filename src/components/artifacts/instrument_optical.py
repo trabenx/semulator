@@ -2,6 +2,10 @@ import numpy as np
 import cv2
 from src.core.utils import get_kernel
 from scipy.ndimage import convolve1d, binary_erosion, gaussian_filter
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 def apply_psf_blur(image, params, rng):
     """Applies simulated probe PSF blur (Gaussian/elliptical)."""
@@ -27,7 +31,7 @@ def apply_psf_blur(image, params, rng):
     # Use BORDER_REFLECT_101 (reflect without repeating border pixel) or BORDER_REPLICATE
     blurred = cv2.filter2D(image, -1, kernel, borderType=cv2.BORDER_REFLECT_101)
 
-    print(f"Applied PSF blur: sigma={sigma:.2f}, ratio={astigmatism_ratio:.2f}, angle={angle:.1f}")
+    logger.debug(f"Applied PSF blur: sigma={sigma:.2f}, ratio={astigmatism_ratio:.2f}, angle={angle:.1f}")
     return blurred # filter2D preserves float type
 
 
@@ -86,7 +90,7 @@ def apply_defocus_blur(image, params, rng):
 
     # Method 2: Per-pixel filtering (Very slow) - Not implemented
 
-    print(f"Applied spatially varying defocus: max_radius={max_radius:.2f}, angle={angle:.1f}")
+    logger.debug(f"Applied spatially varying defocus: max_radius={max_radius:.2f}, angle={angle:.1f}")
     return np.clip(output_image, 0.0, 1.0)
 
 
@@ -178,7 +182,7 @@ def apply_charging(image, params, rng):
              # Add streaks to the image
              output_image += streaks * intensity_factor * 1.0 # Streaks can be stronger
 
-    print(f"Applied charging simulation: intensity={intensity_factor:.2f}, threshold={brightness_threshold:.2f}")
+    logger.debug(f"Applied charging simulation: intensity={intensity_factor:.2f}, threshold={brightness_threshold:.2f}")
     return np.clip(output_image, 0.0, 1.0)
 
 
@@ -195,7 +199,7 @@ def apply_topographic_shading(image, layers_data, params, rng):
     # --- Generate Height Map ---
     # Option 1: Based on layer structure (simple stacking)
     if rng.random() < use_layer_height_prob and layers_data:
-        print("Generating height map from layers...")
+        logger.debug("Generating height map from layers...")
         # Assign height based on layer index (higher index = higher height)
         layer_height_step = 1.0 / (len(layers_data) + 1)
         # Sort by layer index to ensure correct stacking order
@@ -211,13 +215,13 @@ def apply_topographic_shading(image, layers_data, params, rng):
 
     # Option 2: Random Perlin noise height map
     else:
-        print("Generating height map from Perlin noise...")
+        logger.debug("Generating height map from Perlin noise...")
         try:
              from perlin_noise import PerlinNoise
              HAS_PERLIN = True
         except ImportError:
              HAS_PERLIN = False
-             print("Warning: Perlin noise library not found for topographic shading.")
+             logger.warning("Warning: Perlin noise library not found for topographic shading.")
 
         if HAS_PERLIN:
              noise_gen = PerlinNoise(octaves=6, seed=rng.randint(0, 10000))
@@ -260,7 +264,7 @@ def apply_topographic_shading(image, layers_data, params, rng):
     # Apply shading additively (or multiplicatively?)
     output_image = np.clip(image + shading_effect, 0.0, 1.0)
 
-    print(f"Applied topographic shading: strength={strength:.2f}, light_angle={light_angle_deg:.1f}")
+    logger.debug(f"Applied topographic shading: strength={strength:.2f}, light_angle={light_angle_deg:.1f}")
     return output_image, height_map
 
 
@@ -285,7 +289,7 @@ def apply_gradient_illumination(image, params, rng):
     illumination_effect = (gradient_map - 0.5) * max_delta # Center effect around 0 change
     output_image = image + illumination_effect
 
-    print(f"Applied gradient illumination: max_delta={max_delta:.2f}, angle={angle:.1f}")
+    logger.debug(f"Applied gradient illumination: max_delta={max_delta:.2f}, angle={angle:.1f}")
     return np.clip(output_image, 0.0, 1.0)
 
 
@@ -310,7 +314,7 @@ def apply_striping_smearing(image, params, rng):
      # output_image = image * (1 - strength) + blurred * strength
      output_image = blurred
 
-     print(f"Applied simple {direction}-smearing: strength={strength:.3f}")
+     logger.debug(f"Applied simple {direction}-smearing: strength={strength:.3f}")
      return output_image # Already clipped by blur
 
 
@@ -326,7 +330,7 @@ def apply_fixed_pattern_noise(image, params, rng):
          HAS_PERLIN = False
 
     if not HAS_PERLIN:
-         print("Warning: Perlin noise library not found for FPN.")
+         logger.warning("Warning: Perlin noise library not found for FPN.")
          return image, np.zeros_like(image) # Return zero noise map if skipped
 
     h, w = image.shape
@@ -346,7 +350,7 @@ def apply_fixed_pattern_noise(image, params, rng):
 
     output_image = image + added_noise
 
-    print(f"Added Fixed Pattern Noise: strength={strength:.3f}, scale={scale:.1f}")
+    logger.debug(f"Added Fixed Pattern Noise: strength={strength:.3f}, scale={scale:.1f}")
     return output_image, added_noise
 
 

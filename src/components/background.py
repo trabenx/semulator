@@ -149,6 +149,6 @@ def generate_background(config, size, magnification, rng):
 
     # Ensure background is clipped to [0, 1]
     background = np.clip(background, 0.0, 1.0)
-    logger.info(f"Generated '{bg_type}' background.")
+    logger.debug(f"Generated '{bg_type}' background.")
     return background.astype(np.float32)
 

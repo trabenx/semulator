@@ -2,6 +2,10 @@ import numpy as np
 import cv2
 from scipy.ndimage import gaussian_filter, map_coordinates
 from skimage.transform import warp # Keep using skimage warp for convenience
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 def apply_affine(image, masks, params, rng):
     """Applies affine transform. Operates on float image, uint masks."""
@@ -60,7 +64,7 @@ def apply_affine(image, masks, params, rng):
     warp_dx = xx - original_x
     warp_field = np.stack((warp_dy, warp_dx), axis=-1)
 
-    print(f"Applied affine transform: scale={scale:.2f}, angle={angle:.1f}, shear={shear_x:.1f}, trans=({trans_x:.1f}, {trans_y:.1f})")
+    logger.debug(f"Applied affine transform: scale={scale:.2f}, angle={angle:.1f}, shear={shear_x:.1f}, trans=({trans_x:.1f}, {trans_y:.1f})")
     return warped_image, warped_masks, warp_field
 
 
@@ -115,5 +119,5 @@ def apply_elastic(image, masks, params, rng):
     # So warp_field = (map_y, map_x)
     warp_field = np.stack((map_y, map_x), axis=-1) # H x W x 2 (dy, dx)
 
-    print(f"Applied elastic deformation: alpha={alpha:.1f}, sigma={sigma:.1f}")
+    logger.debug(f"Applied elastic deformation: alpha={alpha:.1f}, sigma={sigma:.1f}")
     return warped_image, warped_masks, warp_field

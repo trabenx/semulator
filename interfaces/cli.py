@@ -107,7 +107,7 @@ def run_cli():
     output_dir = run_settings.get('output_dir', './output_cli')
     master_seed = run_settings.get('master_seed', None)
     final_verbose = run_settings.get('verbose', False)
-    final_log_level = logging.DEBUG if final_verbose else logging.INFO
+    final_log_level = logging.INFO  # logging.DEBUG if final_verbose else logging.INFO
     logging.getLogger().setLevel(final_log_level) # Set root logger level
     logger.info(f"Final log level set to: {logging.getLevelName(final_log_level)}")
     if args.show_config:
@@ -137,7 +137,8 @@ def run_cli():
         return
 
     # --- Decide on Execution Mode (Sequential or Parallel) ---
-    use_multiprocessing = args.workers is not None and args.workers != 1 # Enable if --workers is set > 1
+    max_workers = args.workers if args.workers else os.cpu_count()
+    use_multiprocessing = max_workers != 1 # Enable if --workers is set > 1
     success_count = 0
     if not use_multiprocessing:
         logger.info(f"Starting generation of {num_samples} samples (sequential mode [i.e., single worker])")
@@ -198,7 +199,6 @@ def run_cli():
         import concurrent.futures
         import tqdm # For progress bar (pip install tqdm)
 
-        max_workers = args.workers if args.workers else os.cpu_count()
         logger.info(f"Starting generation of {num_samples} samples using up to {max_workers} worker processes...")
         results = [] # Store boolean results (True/False) from generate_sample
 

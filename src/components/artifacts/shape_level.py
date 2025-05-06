@@ -244,10 +244,10 @@ def apply_etch_bias(mask, params, rng):
 
     if amount_int < 0: # Erosion
         biased_mask = cv2.erode(mask, kernel, iterations=1)
-        print(f"Applied etch bias (erosion): amount={amount_int}")
+        logger.debug(f"Applied etch bias (erosion): amount={amount_int}")
     else: # Dilation
         biased_mask = cv2.dilate(mask, kernel, iterations=1)
-        print(f"Applied etch bias (dilation): amount={amount_int}")
+        logger.debug(f"Applied etch bias (dilation): amount={amount_int}")
 
     return biased_mask
 
