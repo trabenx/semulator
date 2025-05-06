@@ -95,7 +95,7 @@ def save_image_data(image_data, path, bit_depth=16, format_hint=None):
              logger.error(f"File verification FAILED after saving {path}. Check permissions/disk space.")
              return False # Indicate failure
 
-         logger.info(f"Successfully saved {path}")
+         logger.debug(f"Successfully saved {path}")
          return True # Indicate success
 
      except Exception as e:
