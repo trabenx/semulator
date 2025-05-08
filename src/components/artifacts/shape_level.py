@@ -385,5 +385,49 @@ def apply_shape_border(rendered_instance, mask, params, target_intensity, rng):
     # logger.debug(f"Applied shape border: thickness={thickness}, factor={intensity_factor:.2f}, border_intensity={border_intensity:.2f}") # Debug
     return output_render
 
+
+def apply_corner_rounding(mask, params, rng):
+    """
+    Applies morphological opening and/or closing to round sharp corners of a mask.
+    """
+    kernel_size = params.get('kernel_size', 3)
+    kernel_shape_str = params.get('shape', 'ellipse')
+    operation = params.get('operation', 'open') # 'open', 'close', 'close_open', 'open_close'
+
+    # Ensure kernel size is odd and positive
+    kernel_size = max(3, int(kernel_size))
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+
+    # Create kernel
+    if kernel_shape_str == 'rect':
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+    else: # Default to ellipse
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+
+    rounded_mask = mask.copy() # Start with original mask
+
+    try:
+        if operation == 'open':
+            rounded_mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        elif operation == 'close':
+            rounded_mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        elif operation == 'close_open':
+            temp_mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+            rounded_mask = cv2.morphologyEx(temp_mask, cv2.MORPH_OPEN, kernel)
+        elif operation == 'open_close':
+            temp_mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            rounded_mask = cv2.morphologyEx(temp_mask, cv2.MORPH_CLOSE, kernel)
+        else:
+            logger.warning(f"Unknown corner rounding operation '{operation}'. Applying 'open'.")
+            rounded_mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+        # logger.debug(f"Applied corner rounding: op='{operation}', ksize={kernel_size}") # Debug
+    except Exception as e:
+        logger.error(f"Error during corner rounding (op='{operation}', ksize={kernel_size}): {e}", exc_info=True)
+        return mask # Return original mask on error
+
+    return rounded_mask
+
 # --- Factory (if needed, or call directly in generator) ---
 # Factory function might be less useful here as inputs differ (mask vs image_layer)

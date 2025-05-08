@@ -39,7 +39,8 @@ from ..components.shapes import create_shape_mask, render_shape
 from ..components.artifacts.shape_level import (apply_edge_ripple, apply_breaks_holes,
                                                 apply_local_elastic, apply_contour_smoothing,
                                                 apply_local_brightness, apply_etch_bias,
-                                                apply_local_affine, apply_shape_border)
+                                                apply_local_affine, apply_shape_border,
+                                                apply_corner_rounding)
 from ..components.artifacts.geometric import apply_affine, apply_elastic
 from ..components.artifacts.instrument_optical import (apply_psf_blur, apply_defocus_blur,
                                                      apply_charging, apply_topographic_shading,
@@ -66,6 +67,7 @@ SHAPE_MASK_ARTIFACT_FUNCS = {
     'local_elastic': apply_local_elastic, # If mode='local_elastic'
     'local_affine': apply_local_affine,   # If mode='local_affine'
     'contour_smoothing': apply_contour_smoothing,
+    'corner_rounding': apply_corner_rounding
 }
 # Artifacts that modify the RENDERED instance (float array)
 SHAPE_RENDER_ARTIFACT_FUNCS = {
