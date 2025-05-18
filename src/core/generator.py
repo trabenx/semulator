@@ -5,37 +5,17 @@ import time
 import copy
 import logging
 import imageio
+import json
 from pathlib import Path
 
-from .utils import get_rng, ensure_dir, normalize_image, image_to_bit_depth, get_distinct_colors, parse_value, create_color_visualization
+from .utils import (get_rng, ensure_dir, normalize_image, image_to_bit_depth,
+                    get_distinct_colors, create_color_visualization, parse_value)
 from .configuration import randomize_config_for_sample
-from ..components.raffler import Raffler
-from ..components.background import generate_background
-from ..components.patterns import get_pattern_positions
-from ..components.shapes import create_shape_mask, render_shape, draw_shape
-from ..components.noise import apply_noise
-from ..outputs.writers import (save_numpy, save_image_data, save_json_data,
-                             save_gif_data, save_text_file, calculate_hashes)
-from ..outputs.ground_truth import (generate_instance_data, generate_combined_mask,
-                                  generate_defect_mask, create_overlays,
-                                  add_metadata_overlay)
-
-
-logger = logging.getLogger(__name__)
-
-import numpy as np
-import cv2
-import os
-import time
-import logging
-from pathlib import Path
-
-from .utils import get_rng, ensure_dir, normalize_image, image_to_bit_depth, get_distinct_colors
-from .configuration import randomize_config_for_sample
-from ..components.raffler import Raffler
 from ..components.background import generate_background
 from ..components.patterns import get_pattern_positions
 from ..components.shapes import create_shape_mask, render_shape
+from ..components.raffler import Raffler
+from ..components.noise import apply_noise
 from ..components.artifacts.shape_level import (apply_edge_ripple, apply_breaks_holes,
                                                 apply_local_elastic, apply_contour_smoothing,
                                                 apply_local_brightness, apply_etch_bias,
@@ -46,14 +26,12 @@ from ..components.artifacts.instrument_optical import (apply_psf_blur, apply_def
                                                      apply_charging, apply_topographic_shading,
                                                      apply_gradient_illumination, apply_striping_smearing,
                                                      apply_fixed_pattern_noise, apply_edge_brightness)
-from ..components.noise import apply_noise
+
 from ..outputs.writers import (save_numpy, save_image_data, save_json_data,
                              save_gif_data, save_text_file, calculate_hashes)
 from ..outputs.ground_truth import (generate_instance_data, generate_combined_mask,
                                   generate_defect_mask, create_overlays,
                                   add_metadata_overlay)
-
-# Need PerlinNoise here if generating map once per layer
 try: from perlin_noise import PerlinNoise; HAS_PERLIN = True
 except ImportError: HAS_PERLIN = False
 
@@ -183,7 +161,10 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
         layer_defect_masks = {}
         layer_order_map_pre_warp = np.zeros((h, w), dtype=np.uint8) if out_opts.get('save_layer_order_map') else None
         semantic_map_pre_warp = np.zeros((h, w), dtype=np.uint8) if out_opts.get('save_semantic_map') else None
-        
+        # --- Store individual layer masks FOR WARPING ---
+        individual_layer_actual_masks_pre_warp = {} # {layer_config_idx: mask}
+
+
         # --- 3a. Layer Generation Loop ---
         sample_logger.info(f"Processing {len(selected_layers)} selected layers...")
         for layer_render_idx, layer_config_idx in enumerate(layer_indices):
@@ -431,6 +412,7 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
                  except Exception as e_etch:
                      sample_logger.error(f"Error applying etch_bias to layer {layer_config_idx}: {e_etch}", exc_info=True)
             layer_masks_actual[layer_config_idx] = layer_combined_mask_final_actual # Store FINAL actual mask
+            individual_layer_actual_masks_pre_warp[layer_config_idx] = layer_combined_mask_final_actual.copy() # Store for warping
 
             # --- Update Global Maps (using FINAL actual mask) ---
             if layer_order_map is not None:
@@ -492,16 +474,21 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
         sample_logger.info(f"Composing {len(layer_renders_actual)} layers using mode: {composition_mode}")
         cumulative_layers_for_gif = [initial_background.copy()]
         for layer_buffer in layer_renders_actual:
-             if composition_mode == 'additive': image_clean += layer_buffer
-             elif composition_mode == 'multiplicative': image_clean *= (1.0 + layer_buffer * 2) # Example multiplicative blend
-             elif composition_mode == 'overwrite':
-                   current_layer_config_idx = layer_indices[len(cumulative_layers_for_gif)-1] # Index of layer config for this buffer
-                   mask = layer_masks_actual.get(current_layer_config_idx) # Use FINAL actual mask
-                   if mask is not None: image_clean[mask > 0] = layer_buffer[mask > 0]
-                   else: sample_logger.warning(f"Mask not found for layer {current_layer_config_idx} during overwrite composition.")
-             else: image_clean += layer_buffer # Default additive
-             image_clean = np.clip(image_clean, 0.0, 1.0)
-             cumulative_layers_for_gif.append(image_clean.copy())
+            if composition_mode == 'additive': 
+                image_clean += layer_buffer
+            elif composition_mode == 'multiplicative': 
+                image_clean *= (1.0 + layer_buffer * 2) # Example multiplicative blend
+            elif composition_mode == 'overwrite':
+                current_layer_config_idx = layer_indices[len(cumulative_layers_for_gif)-1] # Index of layer config for this buffer
+                mask = layer_masks_actual.get(current_layer_config_idx) # Use FINAL actual mask
+                if mask is not None: 
+                    image_clean[mask > 0] = layer_buffer[mask > 0]
+                else: 
+                    sample_logger.warning(f"Mask not found for layer {current_layer_config_idx} during overwrite composition.")
+            else: 
+                image_clean += layer_buffer # Default additive
+            image_clean = np.clip(image_clean, 0.0, 1.0)
+            cumulative_layers_for_gif.append(image_clean.copy())
 
 
         image_clean_pre_warp = image_clean.copy()
@@ -512,7 +499,7 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
 
         # --- 6. Global Geometric Warping ---
         sample_logger.info("Applying global geometric artifacts...")
-        margin_factor = sample_config['image_settings']['oversize_margin_factor']
+        margin_factor = image_settings.get('oversize_margin_factor', 0.25) # Ensure good margin
         margin_h, margin_w = int(h * margin_factor), int(w * margin_factor)
         oversized_h, oversized_w = h + 2 * margin_h, w + 2 * margin_w
         oversized_shape = (oversized_h, oversized_w)
@@ -526,9 +513,9 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
                 # Ensure exact shape due to potential rounding issues
                 return padded[:target_shape[0], :target_shape[1]]
             except Exception as e_embed:
-                 sample_logger.error(f"Error embedding image/mask into oversized canvas: {e_embed}", exc_info=True)
-                 # Return an empty canvas of the target shape/dtype as fallback
-                 return np.full(target_shape, border_value, dtype=img.dtype)
+                sample_logger.error(f"Error embedding image/mask into oversized canvas: {e_embed}", exc_info=True)
+                # Return an empty canvas of the target shape/dtype as fallback
+                return np.full(target_shape, border_value, dtype=img.dtype if hasattr(img, 'dtype') else np.float32)
 
 
         # Embed data needed for warping
@@ -536,49 +523,100 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
         semantic_map_oversized = embed_in_oversized(semantic_map_pre_warp, oversized_shape, margin_h, margin_w, cv2.BORDER_CONSTANT, 0) if semantic_map_pre_warp is not None else None
         layer_order_map_oversized = embed_in_oversized(layer_order_map_pre_warp, oversized_shape, margin_h, margin_w, cv2.BORDER_CONSTANT, 0) if layer_order_map_pre_warp is not None else None
 
+        # Embed individual layer masks (actual ones, after per-layer artifacts)
+        oversized_individual_layer_masks = {}
+        sorted_layer_indices_for_warp = sorted(individual_layer_actual_masks_pre_warp.keys()) # Consistent order
+        for layer_idx in sorted_layer_indices_for_warp:
+            mask_to_embed = individual_layer_actual_masks_pre_warp[layer_idx]
+            oversized_individual_layer_masks[layer_idx] = embed_in_oversized(
+                mask_to_embed, oversized_shape, margin_h, margin_w, cv2.BORDER_CONSTANT, 0
+            )
+
         # Apply geometric artifacts (loop through raffled effects)
         geometric_artifacts = raff.raffle_effects('geometric')
         warp_field_combined = None
-        maps_to_warp = [m for m in [semantic_map_oversized, layer_order_map_oversized] if m is not None]
         applied_geometric_artifacts = []
+        
+        # Prepare list of all masks to warp (semantic, layer_order, then individual layer masks)
+        all_masks_to_warp_oversized = []
+        if semantic_map_oversized is not None:
+            all_masks_to_warp_oversized.append(semantic_map_oversized)
+        if layer_order_map_oversized is not None:
+            all_masks_to_warp_oversized.append(layer_order_map_oversized)
+        # Add individual layer masks in consistent order
+        individual_masks_list_for_warp = [oversized_individual_layer_masks[idx] for idx in sorted_layer_indices_for_warp if oversized_individual_layer_masks[idx] is not None]
+        all_masks_to_warp_oversized.extend(individual_masks_list_for_warp)
 
         for artifact in geometric_artifacts:
-             func = GEOMETRIC_ARTIFACT_FUNCS.get(artifact['name'])
-             if func:
-                  try:
-                       sample_logger.info(f"Applying geometric artifact: {artifact['name']}")
-                       image_clean_oversized, warped_maps_out, warp_field = \
-                           func(image_clean_oversized, maps_to_warp, artifact['params'], sample_rng)
-                       if warped_maps_out: maps_to_warp = warped_maps_out # Update for next warp step
-                       if warp_field is not None: warp_field_combined = warp_field # Store last warp field
-                       applied_geometric_artifacts.append(artifact['name'])
-                  except Exception as e_geo_art: sample_logger.error(f"Error applying geometric artifact {artifact['name']}: {e_geo_art}", exc_info=True)
-             else: sample_logger.warning(f"Geometric artifact function '{artifact['name']}' not found.")
+            func = GEOMETRIC_ARTIFACT_FUNCS.get(artifact['name'])
+            if func:
+                try:
+                    sample_logger.info(f"Applying geometric artifact: {artifact['name']}")
+                    image_clean_oversized, warped_all_masks_out, warp_field = \
+                        func(image_clean_oversized, all_masks_to_warp_oversized, artifact['params'], sample_rng) # Pass list of masks
 
-        # Update maps after warping
-        semantic_map_warped = None; layer_order_map_warped = None
-        map_idx = 0
-        if semantic_map_oversized is not None: semantic_map_warped = maps_to_warp[map_idx]; map_idx += 1
-        if layer_order_map_oversized is not None: layer_order_map_warped = maps_to_warp[map_idx]; map_idx += 1
+                    if warped_all_masks_out: all_masks_to_warp_oversized = warped_all_masks_out # Update for next warp step
+                    if warp_field is not None: warp_field_combined = warp_field
+                    applied_geometric_artifacts.append(artifact['name'])
+                except Exception as e_geo_art: sample_logger.error(f"Error applying geometric artifact {artifact['name']}: {e_geo_art}", exc_info=True)
+            else: sample_logger.warning(f"Geometric artifact function '{artifact['name']}' not found.")
 
         # Center Crop Back
         image_clean_warped = image_clean_oversized[margin_h:margin_h+h, margin_w:margin_w+w]
-        semantic_map = semantic_map_warped[margin_h:margin_h+h, margin_w:margin_w+w] if semantic_map_warped is not None else None
-        layer_order_map = layer_order_map_warped[margin_h:margin_h+h, margin_w:margin_w+w] if layer_order_map_warped is not None else None
         warp_field_final = warp_field_combined[margin_h:margin_h+h, margin_w:margin_w+w] if warp_field_combined is not None else None
-        image_post_geometric_warp = image_clean_warped.copy() # Capture state here
-        sample_logger.debug("Geometric warping complete.")
 
+        # Extract warped maps
+        current_map_idx = 0
+        semantic_map_warped = None
+        if semantic_map_oversized is not None and len(all_masks_to_warp_oversized) > current_map_idx:
+            semantic_map_warped = all_masks_to_warp_oversized[current_map_idx][margin_h:margin_h+h, margin_w:margin_w+w]
+            current_map_idx += 1
+        layer_order_map_warped = None # Assign post-warp variable name
+        if layer_order_map_oversized is not None and len(all_masks_to_warp_oversized) > current_map_idx:
+            layer_order_map_warped = all_masks_to_warp_oversized[current_map_idx][margin_h:margin_h+h, margin_w:margin_w+w]
+            current_map_idx += 1
+
+        # Extract and store warped individual layer masks
+        warped_individual_layer_masks = {}
+        for i, layer_idx in enumerate(sorted_layer_indices_for_warp):
+            if len(all_masks_to_warp_oversized) > (current_map_idx + i):
+                warped_individual_layer_masks[layer_idx] = all_masks_to_warp_oversized[current_map_idx + i][margin_h:margin_h+h, margin_w:margin_w+w]
+                if out_opts.get('save_warped_layer_masks', False): # New config option
+                    # Ensure 'actual_mask_warped' field is part of all_layers_data structure if used
+                    if layer_idx in all_layers_data:
+                        all_layers_data[layer_idx]['actual_mask_warped'] = warped_individual_layer_masks[layer_idx]
+                    else: # Should not happen if all_layers_data correctly populated
+                        sample_logger.warning(f"Layer index {layer_idx} not found in all_layers_data for warped mask storage.")
+            else:
+                sample_logger.warning(f"Not enough warped masks returned to extract individual layer mask for index {layer_idx}")
+                
+        image_post_geometric_warp = image_clean_warped.copy()
+        sample_logger.debug("Geometric warping complete.")
+        
+        def add_path(key, path_obj):
+            if path_obj and path_obj.exists(): # Check if file exists before adding
+                try:
+                    output_paths[key] = str(path_obj.relative_to(output_parent_dir))
+                    save_paths_list.append(path_obj)
+                except ValueError: # Handle case where path might not be relative (e.g. different drive)
+                    output_paths[key] = str(path_obj)
+                    save_paths_list.append(path_obj)
+            elif path_obj:
+                sample_logger.warning(f"File path added to metadata does not exist: {path_obj}")
+                output_paths[key] = f"MISSING: {path_obj.name}"
+        
         # --- 7. Save Post-Geometric Intermediate ---
         if out_opts.get('save_extra_intermediate', False):
             path_post_geo = sample_output_top_dir / "image_post_geometric_warp.png"
             save_image_data(image_post_geometric_warp, path_post_geo, 8)
+            add_path('image_post_geometric_warp', path_post_geo) # Helper to add to a temp list for metadata
 
         # --- 8. Apply Instrument Artifacts ---
         sample_logger.info("Applying instrument artifacts...")
         image_post_instrument = image_post_geometric_warp
         applied_instrument_artifacts = []
-        total_added_fpn = np.zeros_like(image_post_instrument)
+        total_added_fpn = np.zeros_like(image_post_instrument) if image_post_instrument is not None else None
+        topography_height_map = None # Initialize
 
         for artifact in raff.raffle_effects('instrument'): # Raffle instrument effects
             func = INSTRUMENT_ARTIFACT_FUNCS.get(artifact['name'])
@@ -587,96 +625,116 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
                     sample_logger.info(f"Applying instrument artifact: {artifact['name']}")
                     params = artifact.get('params', {})
                     if artifact['name'] == 'topographic_shading':
-                         image_post_instrument, height_map_generated = func(image_post_instrument, all_layers_data, params, sample_rng)
-                         if out_opts.get('save_topography_height_map', False): topography_height_map = height_map_generated
+                        image_post_instrument, height_map_generated = func(image_post_instrument, all_layers_data, params, sample_rng)
+                        if out_opts.get('save_topography_height_map', False): topography_height_map = height_map_generated
                     elif artifact['name'] == 'fixed_pattern_noise':
-                         image_post_instrument, fpn_map = func(image_post_instrument, params, sample_rng)
-                         total_added_fpn += fpn_map
-                    else: # Other instrument effects (psf, defocus, charging, edge_brightness, etc.)
-                         image_post_instrument = func(image_post_instrument, params, sample_rng)
+                        image_post_instrument, fpn_map = func(image_post_instrument, params, sample_rng)
+                        if total_added_fpn is not None and fpn_map is not None: total_added_fpn += fpn_map
+                    else:
+                        image_post_instrument = func(image_post_instrument, params, sample_rng)
                     applied_instrument_artifacts.append(artifact['name'])
                 except Exception as e_inst_art: sample_logger.error(f"Error applying instrument artifact {artifact['name']}: {e_inst_art}", exc_info=True)
             else: sample_logger.warning(f"Instrument artifact function '{artifact['name']}' not found.")
 
-        image_post_instrument = np.clip(image_post_instrument, 0.0, 1.0)
+        if image_post_instrument is not None: image_post_instrument = np.clip(image_post_instrument, 0.0, 1.0)
         sample_logger.debug("Instrument artifacts complete.")
 
-         # --- 9. Save Post-Instrument Intermediate ---
-        if out_opts.get('save_extra_intermediate', False):
-             path_post_inst = sample_output_top_dir / "image_post_instrument.png"
-             save_image_data(image_post_instrument, path_post_inst, 8)
+        # --- 9. Save Post-Instrument Intermediate ---
+        if out_opts.get('save_extra_intermediate', False) and image_post_instrument is not None:
+            path_post_inst = sample_output_top_dir / "image_post_instrument.png"
+            save_image_data(image_post_instrument, path_post_inst, 8)
+            add_path('image_post_instrument', path_post_inst)
 
         # --- 10. Apply Detector Noise ---
         sample_logger.info("Applying detector noise...")
-        image_final_noisy = image_post_instrument.copy()
-        total_added_noise = total_added_fpn.copy()
-        applied_noise_artifacts = []
-        noise_artifacts = raff.raffle_effects('noise')
-        # Apply quantization first if present
-        quant_artifact = next((a for a in noise_artifacts if a.get('name') == 'quantization'), None)
-        if quant_artifact:
-             try:
-                  logger.info(f"Applying noise: {quant_artifact['name']}")
-                  image_final_noisy, q_noise = apply_noise(image_final_noisy, quant_artifact['name'], quant_artifact['params'], sample_rng)
-                  total_added_noise += q_noise
-                  applied_noise_artifacts.append(quant_artifact['name'])
-             except Exception as e: sample_logger.error(f"Error applying quantization: {e}", exc_info=True)
-        # Apply other noise types
-        for artifact in noise_artifacts:
-             if artifact.get('name') == 'quantization': continue
-             noise_type = artifact.get('name')
-             if not noise_type: continue
-             try:
-                 sample_logger.info(f"Applying noise: {noise_type}")
-                 image_final_noisy, added_noise = apply_noise(image_final_noisy, noise_type, artifact['params'], sample_rng)
-                 if added_noise is not None: total_added_noise += added_noise
-                 applied_noise_artifacts.append(noise_type)
-             except Exception as e_noise: sample_logger.error(f"Error applying noise {noise_type}: {e_noise}", exc_info=True)
-        image_final_noisy = np.clip(image_final_noisy, 0.0, 1.0)
+        image_final_noisy = image_post_instrument.copy() if image_post_instrument is not None else None
+        if image_final_noisy is not None :
+            total_added_noise = total_added_fpn.copy() if total_added_fpn is not None else np.zeros_like(image_final_noisy)
+            applied_noise_artifacts = []
+            noise_artifacts = raff.raffle_effects('noise')
+
+            # Apply quantization first if present
+            quant_artifact = next((a for a in noise_artifacts if a.get('name') == 'quantization'), None)
+            if quant_artifact:
+                try:
+                    logger.info(f"Applying noise: {quant_artifact['name']}")
+                    image_final_noisy, q_noise = apply_noise(image_final_noisy, quant_artifact['name'], quant_artifact['params'], sample_rng)
+                    total_added_noise += q_noise
+                    applied_noise_artifacts.append(quant_artifact['name'])
+                except Exception as e: sample_logger.error(f"Error applying quantization: {e}", exc_info=True)
+            # Apply other noise types
+            for artifact in noise_artifacts:
+                if artifact.get('name') == 'quantization': 
+                    continue
+                noise_type = artifact.get('name')
+                if not noise_type:
+                    continue
+                try:
+                    sample_logger.info(f"Applying noise: {noise_type}")
+                    image_final_noisy, added_noise = apply_noise(image_final_noisy, noise_type, artifact['params'], sample_rng)
+                    if added_noise is not None:
+                        total_added_noise += added_noise
+                    applied_noise_artifacts.append(noise_type)
+                except Exception as e_noise:
+                    sample_logger.error(f"Error applying noise {noise_type}: {e_noise}", exc_info=True)
+            image_final_noisy = np.clip(image_final_noisy, 0.0, 1.0)
         sample_logger.debug("Detector noise complete.")
 
         # --- 11. Generate Final Instance GT from Warped Data ---
         sample_logger.info("Generating final instance data...")
+        final_instance_mask = None
+        final_instance_metadata = {}
         if out_opts.get('save_bounding_boxes', False):
-            if semantic_map is not None:
-                 try:
-                    # Use generate_instance_data with warped map
+            if warped_individual_layer_masks: # Prefer warped individual masks
+                try:
                     final_instance_mask, final_instance_metadata = generate_instance_data(
-                         layer_masks_actual={}, # Pass empty dict as layer masks aren't warped individually
-                         warped_semantic_map=semantic_map # Pass warped map
+                        layer_masks_actual=warped_individual_layer_masks
+                    )
+                    sample_logger.info(f"Generated {len(final_instance_metadata)} instance annotations from warped layer masks.")
+                except Exception as e_inst:
+                    sample_logger.error(f"Error generating instance data from warped layer masks: {e_inst}", exc_info=True)
+                    final_instance_metadata = {'error': "Failed: instance data from warped layer masks."}
+            elif semantic_map_warped is not None: # Fallback to semantic map
+                try:
+                    final_instance_mask, final_instance_metadata = generate_instance_data(
+                        warped_semantic_map=semantic_map_warped
                     )
                     sample_logger.info(f"Generated {len(final_instance_metadata)} instance annotations from warped semantic map.")
-                 except Exception as e_inst:
-                      sample_logger.error(f"Error generating instance data from warped map: {e_inst}", exc_info=True)
-                      final_instance_metadata = {'error': "Failed to generate instance data post-warp."} # Store error
+                except Exception as e_inst_sem:
+                    sample_logger.error(f"Error generating instance data from warped semantic map: {e_inst_sem}", exc_info=True)
+                    final_instance_metadata = {'error': "Failed: instance data from warped semantic map."}
             else:
-                 final_instance_metadata = {'placeholder': "Cannot generate instance data without semantic map."}
+                final_instance_metadata = {'placeholder': "Cannot generate instance data: no suitable warped maps."}
+
+
+        # --- Generate Final Combined Actual Mask ---
+        final_combined_actual_mask = None
+        if out_opts.get('save_masks', False) and warped_individual_layer_masks:
+            final_combined_actual_mask = generate_combined_mask(warped_individual_layer_masks)
+        elif out_opts.get('save_masks', False) and final_instance_mask is not None: # Fallback
+            final_combined_actual_mask = (final_instance_mask > 0).astype(np.uint8)
 
 
         # --- 12. Generate Overlays ---
         sample_logger.info("Generating overlays...")
-        final_image_vis_8bit = image_to_bit_depth(image_final_noisy, 8)
-        try:
-            # Use final_instance_mask if generated, else None
-             overlay_contour_vis, instance_mask_vis_maybe, warp_field_vis = create_overlays(
-                 final_image_vis_8bit,
-                 (final_instance_mask > 0).astype(np.uint8) if final_instance_mask is not None else None, # Create combined mask from instance mask
-                 final_instance_mask,
-                 warp_field_final,
-                 layer_id_to_color
-             )
-             # Check if instance_mask_vis was actually generated
-             instance_mask_vis = instance_mask_vis_maybe
-        except Exception as e_overlay:
-             sample_logger.error(f"Error generating overlays: {e_overlay}", exc_info=True)
-
-        metadata_text = f"Sample: {sample_idx:05d}\nSeed: {sample_seed}\nMag: {magnification:.2f}x"
-        overlay_metadata_vis = add_metadata_overlay(final_image_vis_8bit, text=metadata_text, pixel_size_nm=pixel_size_nm)
+        final_image_vis_8bit = image_to_bit_depth(image_final_noisy, 8) if image_final_noisy is not None else None
+        overlay_contour_vis, instance_mask_vis, warp_field_vis_overlay = None, None, None
+        if final_image_vis_8bit is not None:
+            try:
+                overlay_contour_vis, instance_mask_vis, warp_field_vis_overlay = create_overlays(
+                    final_image_vis_8bit,
+                    final_combined_actual_mask, # Use the one generated from warped masks
+                    final_instance_mask,
+                    warp_field_final,
+                    layer_id_to_color
+                )
+            except Exception as e_overlay: sample_logger.error(f"Error generating overlays: {e_overlay}", exc_info=True)
+            metadata_text = f"Sample: {sample_idx:05d}\nSeed: {sample_seed}\nMag: {magnification:.2f}x"
+            overlay_metadata_vis = add_metadata_overlay(final_image_vis_8bit, text=metadata_text, pixel_size_nm=pixel_size_nm)
 
         if out_opts.get('save_gifs') and cumulative_layers_for_gif:
-             for frame in cumulative_layers_for_gif:
-                  actual_layer_gif_frames.append(image_to_bit_depth(frame, 8))
-    
+            for frame in cumulative_layers_for_gif:
+                actual_layer_gif_frames.append(image_to_bit_depth(frame, 8))
     
         # --- 13. Prepare Metadata ---
         metadata = {
@@ -706,17 +764,6 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
 
         # --- 14. Save Final Outputs ---
         sample_logger.info("Saving final outputs...")
-        def add_path(key, path_obj):
-            if path_obj and path_obj.exists(): # Check if file exists before adding
-                try:
-                    output_paths[key] = str(path_obj.relative_to(output_parent_dir))
-                    save_paths_list.append(path_obj)
-                except ValueError: # Handle case where path might not be relative (e.g. different drive)
-                     output_paths[key] = str(path_obj)
-                     save_paths_list.append(path_obj)
-            elif path_obj:
-                 sample_logger.warning(f"File path added to metadata does not exist: {path_obj}")
-                 output_paths[key] = f"MISSING: {path_obj.name}"
 
         # --- Main Image ---
         final_image_format = out_opts.get('output_formats', {}).get('final_image', 'tif').lower()
@@ -797,15 +844,33 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
                 # Instance vis saved below in overlays
 
         # Layer Order Map
-        if out_opts.get('save_layer_order_map', False) and layer_order_map is not None:
-             path_lom = sample_output_top_dir / "layer_order_map.npy"; save_numpy(layer_order_map.astype(np.uint8), path_lom); add_path('layer_order_map_npy', path_lom)
-             if out_opts.get('save_visualizations'):
-                  lom_vis_gray = normalize_image(layer_order_map); path_lom_vis = sample_output_top_dir / "layer_order_map_vis.png"; save_image_data(lom_vis_gray, path_lom_vis, 8); add_path('layer_order_map_vis', path_lom_vis)
+        if out_opts.get('save_layer_order_map', False) and layer_order_map_warped is not None:
+            path_lom = sample_output_top_dir / "layer_order_map.npy"
+            save_numpy(layer_order_map_warped.astype(np.uint8), path_lom)
+            add_path('layer_order_map_npy', path_lom)
+            if out_opts.get('save_visualizations'):
+                lom_vis_gray = normalize_image(layer_order_map_warped)
+                path_lom_vis = sample_output_top_dir / "layer_order_map_vis.png"
+                save_image_data(lom_vis_gray, path_lom_vis, 8)
+                add_path('layer_order_map_vis', path_lom_vis)
+
         # Semantic Map
-        if out_opts.get('save_semantic_map', False) and semantic_map is not None:
-             path_sem = sample_output_top_dir / "semantic_map_layer_idx.npy"; save_numpy(semantic_map.astype(np.uint8), path_sem); add_path('semantic_map_npy', path_sem)
+        if out_opts.get('save_semantic_map', False) and semantic_map_warped is not None:
+             path_sem = sample_output_top_dir / "semantic_map_layer_idx.npy"
+             save_numpy(semantic_map_warped.astype(np.uint8), path_sem)
+             add_path('semantic_map_npy', path_sem)
              if out_opts.get('save_visualizations'):
-                 max_layer_idx = np.max(semantic_map); sem_colormap = {i: layer_id_to_color.get(i-1, (128,128,128)) for i in range(1, max_layer_idx + 1)}; sem_vis = create_color_visualization(semantic_map, sem_colormap); path_sem_vis = sample_output_top_dir / "semantic_map_layer_idx_vis.png"; save_image_data(sem_vis, path_sem_vis, 8); add_path('semantic_map_vis', path_sem_vis)
+                max_layer_idx = np.max(semantic_map_warped)
+                sem_colormap = {i: layer_id_to_color.get(i-1, (128,128,128)) for i in range(1, max_layer_idx + 1)}
+                sem_vis = create_color_visualization(semantic_map_warped, sem_colormap)
+                path_sem_vis = sample_output_top_dir / "semantic_map_layer_idx_vis.png"
+                save_image_data(sem_vis, path_sem_vis, 8)
+                add_path('semantic_map_vis', path_sem_vis)
+                
+        # Save final combined actual mask if generated
+        if final_combined_actual_mask is not None and out_opts.get('save_masks'):
+            save_numpy(final_combined_actual_mask, sample_output_top_dir / "combined_actual_mask.npy") # etc.
+
         # Height Map
         if out_opts.get('save_topography_height_map', False) and topography_height_map is not None:
              path_hm = sample_output_top_dir / "topography_height_map.npy"; save_numpy(topography_height_map, path_hm); add_path('height_map_npy', path_hm)

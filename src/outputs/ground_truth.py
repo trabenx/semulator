@@ -6,102 +6,136 @@ import logging
 logger = logging.getLogger(__name__)
 
 def generate_instance_data(warped_semantic_map=None, layer_masks_actual=None):
-     """
-     Generates a final instance mask and extracts instance metadata primarily
-     from a warped semantic map (layer index map). Can optionally use pre-warped
-     layer masks as a fallback (currently less preferred).
+    """
+    Generates a final instance mask and extracts instance metadata primarily
+    from a warped semantic map (layer index map). Can optionally use pre-warped
+    layer masks as a fallback (currently less preferred).
 
-     Args:
-         warped_semantic_map (np.ndarray | None): Warped map where pixel value is
-             layer_config_idx + 1 (0 for background). Shape (H, W), dtype uint8.
-         layer_masks_actual (dict | None): Deprecated - primarily use semantic map.
-             {layer_idx: actual_mask_for_layer (HxW, uint8)} - represents masks *before* warping.
+    Args:
+        warped_semantic_map (np.ndarray | None): Warped map where pixel value is
+            layer_config_idx + 1 (0 for background). Shape (H, W), dtype uint8.
+        layer_masks_actual (dict | None): Deprecated - primarily use semantic map.
+            {layer_idx: actual_mask_for_layer (HxW, uint8)} - represents masks *before* warping.
 
-     Returns:
-         tuple: (
-             instance_mask (np.ndarray|None): Final instance mask after warp
-                 (HxW, uint16/uint32), or None if generation failed.
-             instance_metadata (dict): {instance_id: {'layer_config_idx': L,
-                 'bbox_xywh': [x,y,w,h], 'centroid_xy': [cx, cy]}}
-                 Coordinates are relative to the final warped image frame.
-         )
-     """
-     instance_mask = None
-     instance_metadata = {}
+    Returns:
+        tuple: (
+            instance_mask (np.ndarray|None): Final instance mask after warp
+                (HxW, uint16/uint32), or None if generation failed.
+            instance_metadata (dict): {instance_id: {'layer_config_idx': L,
+                'bbox_xywh': [x,y,w,h], 'centroid_xy': [cx, cy]}}
+                Coordinates are relative to the final warped image frame.
+        )
+    """
+    instance_mask = None
+    instance_metadata = {}
+    h, w = (0,0)
+    binary_map_for_cc = None # Initialize
 
-     if warped_semantic_map is None or not isinstance(warped_semantic_map, np.ndarray):
-         logger.warning("Cannot generate instance data: Warped semantic map is missing or invalid.")
-         # Optional: Fallback to using layer_masks_actual if needed, but that requires
-         # warping them individually which is complex and not implemented here.
-         return None, {}
+    valid_layer_masks_present = False
+    if layer_masks_actual and isinstance(layer_masks_actual, dict):
+        # Check if there's at least one non-None mask with some content
+        for mask_array in layer_masks_actual.values():
+            if mask_array is not None and isinstance(mask_array, np.ndarray) and mask_array.sum() > 0:
+                valid_layer_masks_present = True
+                break
 
-     h, w = warped_semantic_map.shape
-     logger.info("Generating instance data from warped semantic map...")
+    if valid_layer_masks_present:
+        logger.info("Generating instance data from provided layer_masks_actual (assumed warped).")
+        # Combine all actual layer masks into one composite mask
+        first_valid_mask = next((m for m in layer_masks_actual.values() if m is not None), None)
+        if first_valid_mask is None:
+            logger.error("No valid masks in layer_masks_actual.")
+            return None, {}
+        h, w = first_valid_mask.shape
+        composite_actual_mask = np.zeros((h, w), dtype=np.uint8)
+        for layer_idx in sorted(layer_masks_actual.keys()):
+            mask = layer_masks_actual[layer_idx]
+            if mask is not None:
+                composite_actual_mask[mask > 0] = 1 # Use 1 temporarily for CC
+        binary_map_for_cc = composite_actual_mask
+    elif warped_semantic_map is not None and isinstance(warped_semantic_map, np.ndarray):
+        logger.info("Generating instance data from warped_semantic_map (fallback).")
+        h, w = warped_semantic_map.shape
+        binary_map_for_cc = (warped_semantic_map > 0).astype(np.uint8)
+    else:
+        logger.warning("Cannot generate instance data: Neither valid layer_masks_actual nor warped_semantic_map provided.")
+        return None, {}
 
-     try:
-         # Binarize the semantic map (any layer > 0 is foreground)
-         binary_map_for_cc = (warped_semantic_map > 0).astype(np.uint8)
+    if binary_map_for_cc is None or binary_map_for_cc.sum() == 0: # Check if any foreground pixels
+        logger.warning("Binary map for connected components is empty. No instances to generate.")
+        return np.zeros((h, w), dtype=np.uint16), {} # Return empty map if h,w known
 
-         # Find connected components in the warped map
-         num_labels, labels_im, stats, centroids = cv2.connectedComponentsWithStats(
-             binary_map_for_cc, connectivity=8, ltype=cv2.CV_32S
-         )
+    if h == 0 or w == 0:
+        logger.error("Invalid map dimensions for instance generation.")
+        return None, {}
 
-         max_instance_id = num_labels - 1
-         if max_instance_id <= 0:
-             logger.warning("No instances found in warped semantic map.")
-             return np.zeros((h, w), dtype=np.uint16), {} # Return empty map
+    logger.info("Generating instance data from warped semantic map...")
 
-         # Determine required dtype for final instance mask
-         dtype = np.uint16 if max_instance_id < 65535 else np.uint32
-         if max_instance_id >= 2**32:
-              logger.warning(f"Exceeded maximum instance ID limit for uint32 ({max_instance_id})!")
-              # Continue but some IDs might wrap around if not handled downstream
+    try:
+        num_labels, labels_im, stats, centroids = cv2.connectedComponentsWithStats(
+            binary_map_for_cc, connectivity=8, ltype=cv2.CV_32S
+        )
 
-         # Create the final instance mask (labels start from 1)
-         instance_mask = labels_im.astype(dtype)
+        max_instance_id = num_labels - 1
+        if max_instance_id <= 0:
+            logger.warning("No instances found in warped semantic map.")
+            return np.zeros((h, w), dtype=np.uint16), {} # Return empty map
 
-         # Extract metadata (bbox, centroid, layer_idx)
-         # stats columns: 0:left(x), 1:top(y), 2:width, 3:height, 4:area
-         # centroids columns: 0:x, 1:y
-         for inst_id in range(1, num_labels): # Skip background label 0
-             # Clip instance ID if it exceeds dtype max (shouldn't happen if check above works)
-             current_inst_id_clipped = min(inst_id, np.iinfo(dtype).max)
-             if current_inst_id_clipped != inst_id:
-                  logger.warning(f"Clipping instance ID {inst_id} to {current_inst_id_clipped}")
+        # Determine required dtype for final instance mask
+        dtype = np.uint16 if max_instance_id < 65535 else np.uint32
+        if max_instance_id >= 2**32:
+            logger.warning(f"Exceeded maximum instance ID limit for uint32 ({max_instance_id})!")
+            # Continue but some IDs might wrap around if not handled downstream
 
-             # Get stats (ensure indexing is correct)
-             x, y, w_box, h_box, area = stats[inst_id]
-             cx, cy = centroids[inst_id]
+        # Create the final instance mask (labels start from 1)
+        instance_mask = labels_im.astype(dtype)
 
-             # Determine original layer index from semantic map at centroid
-             int_cx, int_cy = int(round(cx)), int(round(cy))
-             layer_config_idx = -1 # Default if unknown
-             if 0 <= int_cy < h and 0 <= int_cx < w: # Check bounds
-                 semantic_value = warped_semantic_map[int_cy, int_cx]
-                 if semantic_value > 0:
-                     layer_config_idx = int(semantic_value) - 1 # Map stores index + 1
-                 else:
-                      # Centroid landed on background in semantic map (e.g., due to warping near edge)
-                      # Try sampling near centroid or use majority vote in bbox? For now, mark as unknown.
-                      logger.debug(f"Centroid for instance {inst_id} landed on background (value 0) in semantic map.")
-             else:
-                  logger.debug(f"Centroid for instance {inst_id} ({cx:.1f}, {cy:.1f}) is outside image bounds.")
+        # Extract metadata (bbox, centroid, layer_idx)
+        # stats columns: 0:left(x), 1:top(y), 2:width, 3:height, 4:area
+        # centroids columns: 0:x, 1:y
+        for inst_id in range(1, num_labels): # Skip background label 0
+            # Clip instance ID if it exceeds dtype max (shouldn't happen if check above works)
+            current_inst_id_clipped = min(inst_id, np.iinfo(dtype).max)
+
+            # Get stats (ensure indexing is correct)
+            x, y, w_box, h_box, area = stats[inst_id]
+            cx, cy = centroids[inst_id]
+
+            # Determine original layer index from semantic map at centroid
+            int_cx, int_cy = int(round(cx)), int(round(cy))
+            layer_config_idx = -1 # Default if unknown
+            if 0 <= int_cy < h and 0 <= int_cx < w:
+                if valid_layer_masks_present: # Prefer individual layer masks for assigning layer_idx
+                        # Iterate through original layer indices. The actual mask values are 0/1
+                        for original_layer_idx in sorted(layer_masks_actual.keys(), reverse=True): # Topmost
+                            layer_mask_data = layer_masks_actual.get(original_layer_idx)
+                            if layer_mask_data is not None and layer_mask_data[int_cy, int_cx] > 0:
+                               layer_config_idx = original_layer_idx
+                               break
+                elif warped_semantic_map is not None: # Fallback to semantic map
+                    semantic_value = warped_semantic_map[int_cy, int_cx]
+                    if semantic_value > 0:
+                        layer_config_idx = int(semantic_value) - 1
+                # else: layer_config_idx remains -1 (unknown)
+                else:
+                    logger.debug(f"Centroid for instance label {inst_id_label} ({cx:.1f}, {cy:.1f}) is outside image bounds.")
 
 
-             instance_metadata[current_inst_id_clipped] = {
-                 'layer_config_idx': layer_config_idx, # The original index from the config list
-                 'bbox_xywh': [int(x), int(y), int(w_box), int(h_box)],
-                 'centroid_xy': [float(cx), float(cy)]
-             }
 
-         logger.info(f"Generated instance data with {max_instance_id} instances.")
 
-     except Exception as e:
-          logger.error(f"Error during instance data generation from semantic map: {e}", exc_info=True)
-          return None, {} # Return None on failure
+                instance_metadata[current_inst_id_clipped] = {
+                    'layer_config_idx': layer_config_idx, # The original index from the config list
+                    'bbox_xywh': [int(x), int(y), int(w_box), int(h_box)],
+                    'centroid_xy': [float(cx), float(cy)]
+                }
 
-     return instance_mask, instance_metadata
+        logger.info(f"Generated instance data with {max_instance_id} instances.")
+
+    except Exception as e:
+        logger.error(f"Error during instance data generation from semantic map: {e}", exc_info=True)
+        return None, {} # Return None on failure
+
+    return instance_mask, instance_metadata
 
 
 
