@@ -59,7 +59,7 @@
         "intensity_range": [0.4, 0.6],
         "alpha_range": [0.6, 0.9],
         "shape_params": {
-          "thickness_range": [3, 10]
+          "thickness_range": [3, 40]
         },
         "pattern_params": {
           "count_range": [3, 15],
@@ -87,7 +87,9 @@
         "intensity_range": [0.1, 0.4],
         "alpha_range": [0.8, 1.0],
         "shape_params": {
-           "radius_range": [15, 35], "num_sides_range": [5, 8], "irregularity_range": [0.0, 0.3]
+           "radius_range": [15, 55],
+           "num_sides_range": [5, 8],
+           "irregularity_range": [0.0, 0.3]
         },
         "pattern_params": { "num_shapes_range": [5, 15] }
       },      
@@ -129,7 +131,7 @@
         "shape_params": {
            "amplitude_range": [2, 8],
            "wavelength_range": [20, 60],
-           "thickness_range": [6, 40]
+           "thickness_range": [6, 60]
         },
         "pattern_params": { "count_range": [4, 10], "spacing_jitter_fraction_range": [0.1, 0.3] }
       },
@@ -142,8 +144,8 @@
         "intensity_range": [0.5, 0.9],
         "alpha_range": [0.85, 1.0],
         "shape_params": {
-           "size_range": [20, 150], 
-           "rotation_range": [-45, 45]
+           "size_range": [50, 180], 
+           "rotation_range": [-90, 90]
         },
         "pattern_params": { "num_shapes_range": [5, 12] }
       },
@@ -155,7 +157,7 @@
         "pattern": "sine_wave_horizontal", 
         "intensity_range": [0.6, 0.9], 
         "alpha_range": [0.8, 1.0],
-        "shape_params": { "thickness_range": [4, 12]},
+        "shape_params": { "thickness_range": [4, 60]},
         "pattern_params": {
             "num_waves_range": [3, 10],        
             "vertical_spacing_range": [15, 50], 
@@ -174,7 +176,7 @@
         "pattern": "hex_grid", 
         "intensity_range": [0.0, 0.1], 
         "alpha_range": [0.95, 1.0], 
-        "shape_params": { "radius_range": [8, 20] },
+        "shape_params": { "radius_range": [8, 40] },
         "pattern_params": { "spacing_factor_range": [1.8, 3.0], "jitter_fraction_range": [0.0, 0.08]  },
         "__comment": "Dark holes in hex pattern. Needs bright background/underlayer."
       }
@@ -211,11 +213,11 @@
 	  ],
       "noise": [
         { "name": "gaussian", "probability": 0.8, "params": {"sigma_range": [0.01, 0.05]} },
-        { "name": "poisson", "probability": 0.5, "params": {"scale_range": [0.05, 0.2]} }, 
-        { "name": "salt_pepper", "probability": 0.2, "params": {"probability_range": [0.001, 0.01]} },
+        { "name": "poisson", "probability": 0.6, "params": {"scale_range": [0.05, 0.2]} }, 
+        { "name": "salt_pepper", "probability": 0.1, "params": {"probability_range": [0.001, 0.01]} },
         { "name": "sem_texture", "probability": 0.85, "params": {"scale_range": [10, 40], "octaves_range": [4, 7], "contrast_range": [0.04, 0.12], "anisotropy_range":[1.0, 1.5]} },
         { "name": "quantization", "probability": 0.1, "params": {"target_bits_range": [6, 12]}}, 
-        { "name": "blur_noise", "probability": 0.1, "params": {"sigma_range": [0.5, 1.0]}}
+        { "name": "blur_noise", "probability": 0.4, "params": {"sigma_range": [0.5, 1.0]}}
       ]
     }
   },
