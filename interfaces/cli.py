@@ -56,6 +56,8 @@ def parse_cli_args():
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging (overrides config: run_settings.verbose)")
     parser.add_argument("--show-config", action="store_true", help="Print final effective config and exit")
     parser.add_argument("--workers", type=int, default=None, help="Number of worker processes (default: CPU count)") # Add workers arg
+    parser.add_argument("--start-index", type=int, default=0, help="Sample index to start generation from (0-based). Useful for resuming.")
+
     # Add other CLI overrides if needed, using dot notation for help text if desired
     # Example: parser.add_argument("--magnification", type=float, help="Override image_settings.magnification")
     return parser.parse_args() # Parses arguments from sys.argv (which main.py modified)
@@ -106,6 +108,18 @@ def run_cli():
     num_samples = run_settings.get('num_samples', 1)
     output_dir = run_settings.get('output_dir', './output_cli')
     master_seed = run_settings.get('master_seed', None)
+
+    # --- Get Start Index ---
+    start_index = args.start_index
+    if start_index < 0:
+        logger.warning(f"Start index {start_index} is negative. Starting from 0.")
+        start_index = 0
+    if start_index >= num_samples:
+        logger.info(f"Start index {start_index} is >= total number of samples {num_samples}. Nothing to generate.")
+        return
+    logger.info(f"Effective start index: {start_index}")
+    # ---
+
     final_verbose = run_settings.get('verbose', False)
     final_log_level = logging.INFO  # logging.DEBUG if final_verbose else logging.INFO
     logging.getLogger().setLevel(final_log_level) # Set root logger level
