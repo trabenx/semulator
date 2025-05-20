@@ -26,6 +26,7 @@ def save_image_data(image_data, path, bit_depth=16, format_hint=None):
      # --- Input Data Checks ---
      if image_data is None:
          logger.error(f"Cannot save image to {path}: Input data is None.")
+         raise ValueError(f"Cannot save image to {path}: Input data is None.")
          return False # Indicate failure
      if not isinstance(image_data, np.ndarray):
          try: image_data = np.array(image_data)

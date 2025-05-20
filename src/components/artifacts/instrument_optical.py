@@ -4,10 +4,8 @@ from src.core.utils import get_kernel
 from scipy.ndimage import convolve1d, binary_erosion, gaussian_filter
 import logging
 
-logger = logging.getLogger(__name__)
 
-
-def apply_psf_blur(image, params, rng):
+def apply_psf_blur(image, params, rng, logger):
     """Applies simulated probe PSF blur (Gaussian/elliptical)."""
     sigma = params.get('sigma', 1.0)
     astigmatism_ratio = params.get('astigmatism_ratio', 1.0)
@@ -35,7 +33,7 @@ def apply_psf_blur(image, params, rng):
     return blurred # filter2D preserves float type
 
 
-def apply_defocus_blur(image, params, rng):
+def apply_defocus_blur(image, params, rng, logger):
     """Applies spatially varying defocus blur."""
     max_radius = params.get('max_radius', 2.0) # Max sigma of blur
     angle = params.get('gradient_angle_deg', rng.uniform(0, 360)) # Direction of focus gradient
@@ -94,7 +92,7 @@ def apply_defocus_blur(image, params, rng):
     return np.clip(output_image, 0.0, 1.0)
 
 
-def apply_charging(image, params, rng):
+def apply_charging(image, params, rng, logger):
     """Simulates charging artifacts (brightening/streaking near bright edges)."""
     intensity_factor = params.get('intensity', 0.15) # How much to brighten/streak
     edge_threshold_range = params.get('edge_threshold_range', [0.6, 0.9]) # Range for brightness threshold at edges
@@ -186,7 +184,7 @@ def apply_charging(image, params, rng):
     return np.clip(output_image, 0.0, 1.0)
 
 
-def apply_topographic_shading(image, layers_data, params, rng):
+def apply_topographic_shading(image, layers_data, params, rng, logger):
     """Applies shading based on synthetic height map."""
     strength = params.get('strength', 0.3)
     light_angle_deg = params.get('light_angle_deg', 45.0)
@@ -268,7 +266,7 @@ def apply_topographic_shading(image, layers_data, params, rng):
     return output_image, height_map
 
 
-def apply_gradient_illumination(image, params, rng):
+def apply_gradient_illumination(image, params, rng, logger):
     """Applies a gradual brightness gradient across the image."""
     max_delta = params.get('max_delta', 0.2) # Max brightness change (0 to max_delta)
     angle = params.get('angle', rng.uniform(0, 360)) # Gradient direction
@@ -293,7 +291,7 @@ def apply_gradient_illumination(image, params, rng):
     return np.clip(output_image, 0.0, 1.0)
 
 
-def apply_striping_smearing(image, params, rng):
+def apply_striping_smearing(image, params, rng, logger):
      """Simulates simple striping or smearing via directional blur."""
      strength = params.get('strength', 0.03) # Corresponds approx to blur kernel size/effect
      direction = params.get('direction', rng.choice(['h', 'v']))
@@ -318,7 +316,7 @@ def apply_striping_smearing(image, params, rng):
      return output_image # Already clipped by blur
 
 
-def apply_fixed_pattern_noise(image, params, rng):
+def apply_fixed_pattern_noise(image, params, rng, logger):
     """Adds low-frequency noise pattern."""
     scale = params.get('scale', 100.0)
     strength = params.get('strength', 0.02)
@@ -354,7 +352,7 @@ def apply_fixed_pattern_noise(image, params, rng):
     return output_image, added_noise
 
 
-def apply_edge_brightness(image, params, rng):
+def apply_edge_brightness(image, params, rng, logger):
     """
     Adds brightness along the edges of features in the image.
     Simulates higher secondary electron yield at edges/slopes.

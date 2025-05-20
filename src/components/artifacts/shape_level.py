@@ -4,9 +4,8 @@ import logging
 from skimage.draw import disk, rectangle
 from scipy.ndimage import map_coordinates, binary_erosion
 
-logger = logging.getLogger(__name__)
 
-def apply_edge_ripple(mask, params, rng):
+def apply_edge_ripple(mask, params, rng, logger):
     """Applies ripple to shape edges using contour perturbation."""
     amplitude = params.get('amplitude', 2.0) # Increased default example
     frequency_factor = params.get('frequency_factor', 12)
@@ -65,7 +64,7 @@ def apply_edge_ripple(mask, params, rng):
     return output_mask
 
 
-def apply_breaks_holes(mask, params, rng):
+def apply_breaks_holes(mask, params, rng, logger):
     """Introduces random holes (circular) or breaks (rectangular) into shapes."""
     count = params.get('count', 3)
     size_fraction = params.get('size_fraction', 0.1)
@@ -131,7 +130,7 @@ def apply_breaks_holes(mask, params, rng):
     return output_mask
 
 
-def apply_local_elastic(mask, params, rng):
+def apply_local_elastic(mask, params, rng, logger):
     """Applies elastic deformation localized to the mask area."""
     # This is an approximation. True local elastic requires warping only inside.
     # Approach: Apply global elastic, but only keep changes within original mask bounds.
@@ -175,7 +174,7 @@ def apply_local_elastic(mask, params, rng):
         return mask # Return original mask on error
 
 
-def apply_contour_smoothing(mask, params, rng):
+def apply_contour_smoothing(mask, params, rng, logger):
     """Smooths shape contours using Gaussian blur on the mask."""
     ksize = params.get('kernel_size', 5)
     if ksize % 2 == 0: ksize += 1 # Ensure odd kernel size
@@ -189,7 +188,7 @@ def apply_contour_smoothing(mask, params, rng):
     return smoothed_mask
 
 
-def apply_local_brightness(image_layer, mask, params, rng):
+def apply_local_brightness(image_layer, mask, params, rng, logger):
      """Applies brightness variation based on Perlin noise, simulating thickness."""
      # Modifies the float image layer *before* composition
      contrast = params.get('contrast', 0.1)
@@ -229,7 +228,7 @@ def apply_local_brightness(image_layer, mask, params, rng):
      return output_layer
 
 
-def apply_etch_bias(mask, params, rng):
+def apply_etch_bias(mask, params, rng, logger):
     """Applies uniform erosion or dilation to the mask."""
     # Amount is in pixels: negative=erode, positive=dilate
     amount = params.get('amount', rng.uniform(-2.0, 2.0)) # Use range from params if present
@@ -252,7 +251,7 @@ def apply_etch_bias(mask, params, rng):
     return biased_mask
 
 
-def apply_local_affine(mask, params, rng):
+def apply_local_affine(mask, params, rng, logger):
     """
     Applies a small, randomized affine transformation centered on the shape mask.
     Much faster than elastic deformation for per-instance variation.
@@ -334,7 +333,7 @@ def apply_local_affine(mask, params, rng):
     return warped_mask
 
 
-def apply_shape_border(rendered_instance, mask, params, target_intensity, rng):
+def apply_shape_border(rendered_instance, mask, params, target_intensity, rng, logger):
     """
     Modifies the intensity of the border region of a rendered shape instance.
 
@@ -386,7 +385,7 @@ def apply_shape_border(rendered_instance, mask, params, target_intensity, rng):
     return output_render
 
 
-def apply_corner_rounding(mask, params, rng):
+def apply_corner_rounding(mask, params, rng, logger):
     """
     Applies morphological opening and/or closing to round sharp corners of a mask.
     """

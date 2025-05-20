@@ -2,7 +2,6 @@ import numpy as np
 import random
 import math
 import logging # Import logging
-logger = logging.getLogger(__name__)
 
 def _get_shape_dimensions(params):
     """Helper to estimate main dimensions (width, height) from shape params."""
@@ -26,7 +25,7 @@ def generate_single_position(size, params):
     cy = params.get('center_y', h // 2)
     return [(int(cx), int(cy))]
 
-def generate_grid_positions(size, params, rng):
+def generate_grid_positions(size, params, rng, logger):
     h, w = size
     rows = params.get('rows', 5)
     cols = params.get('cols', 5)
@@ -54,7 +53,7 @@ def generate_grid_positions(size, params, rng):
                  positions.append((int(x), int(y)))
     return positions
 
-def generate_hex_grid_positions(size, params, rng):
+def generate_hex_grid_positions(size, params, rng, logger):
     h, w = size
     # Estimate rows/cols based on size and spacing if not provided? More complex. Assume provided.
     # Or determine max possible rows/cols based on spacing.
@@ -93,7 +92,7 @@ def generate_hex_grid_positions(size, params, rng):
                 positions.append((int(x), int(y)))
     return positions
 
-def generate_radial_grid_positions(size, params, rng):
+def generate_radial_grid_positions(size, params, rng, logger):
     h, w = size
     center_x, center_y = w // 2, h // 2
     num_rings = params.get('rings', 3)
@@ -124,7 +123,7 @@ def generate_radial_grid_positions(size, params, rng):
                 positions.append((int(x), int(y)))
     return positions
 
-def generate_random_scatter_positions(size, params, rng):
+def generate_random_scatter_positions(size, params, rng, logger):
     h, w = size
     num_shapes = params.get('num_shapes', 20)
     positions = []
@@ -134,7 +133,7 @@ def generate_random_scatter_positions(size, params, rng):
         positions.append((int(x), int(y)))
     return positions
 
-def generate_full_span_vertical_positions(size, params, rng):
+def generate_full_span_vertical_positions(size, params, rng, logger):
     h, w = size
     count = params.get('count', 10)
     spacing_jitter_fraction = params.get('spacing_jitter_fraction', 0.1)
@@ -152,7 +151,7 @@ def generate_full_span_vertical_positions(size, params, rng):
              positions.append((pt1, pt2))
     return positions
 
-def generate_full_span_horizontal_positions(size, params, rng):
+def generate_full_span_horizontal_positions(size, params, rng, logger):
     h, w = size
     count = params.get('count', 10)
     spacing_jitter_fraction = params.get('spacing_jitter_fraction', 0.1)
@@ -170,7 +169,7 @@ def generate_full_span_horizontal_positions(size, params, rng):
              positions.append((pt1, pt2))
     return positions
 
-def generate_sine_wave_horizontal_paths(size, params, rng):
+def generate_sine_wave_horizontal_paths(size, params, rng, logger):
     """
     Generates paths (lists of points) for horizontal sine waves.
     """
@@ -216,7 +215,7 @@ def generate_sine_wave_horizontal_paths(size, params, rng):
     logger.debug(f"Generated {len(paths)} sine wave paths.")
     return paths # Returns list of lists of points
 
-def get_pattern_positions(pattern_type, size, shape_params, pattern_params, rng):
+def get_pattern_positions(pattern_type, size, shape_params, pattern_params, rng, logger):
     """Factory to get positions based on pattern type."""
     # Combine params, giving pattern_params precedence for pattern-specific keys
     # Pass shape params through for dimension estimation
@@ -224,13 +223,13 @@ def get_pattern_positions(pattern_type, size, shape_params, pattern_params, rng)
     combined_params.update(pattern_params)
 
     if pattern_type == 'single': return generate_single_position(size, combined_params)
-    elif pattern_type == 'grid': return generate_grid_positions(size, combined_params, rng)
-    elif pattern_type == 'hex_grid': return generate_hex_grid_positions(size, combined_params, rng)
-    elif pattern_type == 'radial_grid': return generate_radial_grid_positions(size, combined_params, rng)
-    elif pattern_type == 'random_scatter': return generate_random_scatter_positions(size, combined_params, rng)
-    elif pattern_type == 'full_span_vertical': return generate_full_span_vertical_positions(size, combined_params, rng)
-    elif pattern_type == 'full_span_horizontal': return generate_full_span_horizontal_positions(size, combined_params, rng)
-    elif pattern_type == 'sine_wave_horizontal': return generate_sine_wave_horizontal_paths(size, combined_params, rng)
+    elif pattern_type == 'grid': return generate_grid_positions(size, combined_params, rng, logger)
+    elif pattern_type == 'hex_grid': return generate_hex_grid_positions(size, combined_params, rng, logger)
+    elif pattern_type == 'radial_grid': return generate_radial_grid_positions(size, combined_params, rng, logger)
+    elif pattern_type == 'random_scatter': return generate_random_scatter_positions(size, combined_params, rng, logger)
+    elif pattern_type == 'full_span_vertical': return generate_full_span_vertical_positions(size, combined_params, rng, logger)
+    elif pattern_type == 'full_span_horizontal': return generate_full_span_horizontal_positions(size, combined_params, rng, logger)
+    elif pattern_type == 'sine_wave_horizontal': return generate_sine_wave_horizontal_paths(size, combined_params, rng, logger)
     else:
         print(f"Warning: Pattern type '{pattern_type}' not implemented.")
         return []

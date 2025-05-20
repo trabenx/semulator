@@ -240,6 +240,8 @@
     "save_extra_intermediate": true,
     "save_layer_order_map": true,
     "save_clean_layer_renders": true,
+	"save_debug_oversized_warps": true,
+	"save_debug_composition_steps": true,
     "include_artifact_params_in_metadata": true,
     "output_formats": {
       "final_image": "tif",

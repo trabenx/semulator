@@ -1,10 +1,9 @@
 import numpy as np
+import cv2
 import random
 from ..core.utils import get_rng
 # from skimage.util import random_noise # Can use this too
 import logging
-
-logger = logging.getLogger(__name__)
 
 # Need HAS_PERLIN check here too
 try:
@@ -14,7 +13,7 @@ except ImportError:
     logger.warning("Warning: Perlin noise library not found. Skipping SEM texture noise.")
     HAS_PERLIN = False
 
-def add_gaussian_noise(image, params, rng):
+def add_gaussian_noise(image, params, rng, logger):
     """Adds Gaussian noise."""
     sigma = params.get('sigma', 0.02) # Noise level relative to max intensity (1.0)
     # Use numpy RandomState derived from the generator's RNG for numpy calls
@@ -24,7 +23,7 @@ def add_gaussian_noise(image, params, rng):
     logger.debug(f"Added Gaussian noise: sigma={sigma:.3f}")
     return noisy_image, noise
 
-def add_poisson_noise(image, params, rng):
+def add_poisson_noise(image, params, rng, logger):
     # Approximation: Gaussian noise with std dev = sqrt(intensity * scale)
     scale = params.get('scale', 0.1) # Adjust how much intensity affects noise variance
     variance = np.maximum(0, image) * scale # Variance proportional to signal, ensure non-negative
@@ -35,7 +34,7 @@ def add_poisson_noise(image, params, rng):
     logger.debug(f"Added Poisson-like noise (scale={scale:.2f})")
     return noisy_image, noise
 
-def add_salt_pepper_noise(image, params, rng):
+def add_salt_pepper_noise(image, params, rng, logger):
     """Adds Salt & Pepper noise."""
     prob = params.get('probability', 0.005)
     s_vs_p = 0.5
@@ -63,7 +62,7 @@ def add_salt_pepper_noise(image, params, rng):
     return noisy_image, noise_map
 
 
-def add_sem_texture_noise(image, params, rng):
+def add_sem_texture_noise(image, params, rng, logger):
      """Adds procedural texture noise (e.g., Perlin), potentially anisotropic."""
      # Requires Perlin noise implementation (from library or manual)
      if not HAS_PERLIN: # Check if Perlin is available (from background.py import)
@@ -95,7 +94,7 @@ def add_sem_texture_noise(image, params, rng):
      logger.debug(f"Added SEM texture noise: scale={scale:.1f}, contrast={contrast:.3f}, anisotropy={anisotropy:.2f}")
      return noisy_image, texture_noise
 
-def apply_quantization(image, params, rng):
+def apply_quantization(image, params, rng, logger):
     """Simulates reduction to a lower bit depth."""
     target_bits = params.get('target_bits', 8)
     num_levels = 2**target_bits
@@ -108,7 +107,7 @@ def apply_quantization(image, params, rng):
     return quantized_image, added_noise
 
 
-def apply_blur_noise(image, params, rng):
+def apply_blur_noise(image, params, rng, logger):
      """Applies simple Gaussian blur as a form of noise/signal degradation."""
      sigma = params.get('sigma', 0.7)
      ksize = int(sigma * 6 + 1)
@@ -131,21 +130,21 @@ def apply_blur_noise(image, params, rng):
 # --- Add FPN ---
 
 # --- Factory ---
-def apply_noise(image, noise_type, params, rng):
+def apply_noise(image, noise_type, params, rng, logger):
     """Applies a selected noise type and returns noisy image + added noise map."""
     if noise_type == 'gaussian':
-        return add_gaussian_noise(image, params, rng)
+        return add_gaussian_noise(image, params, rng, logger)
     elif noise_type == 'poisson':
-        return add_poisson_noise(image, params, rng)
+        return add_poisson_noise(image, params, rng, logger)
     elif noise_type == 'salt_pepper':
-        return add_salt_pepper_noise(image, params, rng)
+        return add_salt_pepper_noise(image, params, rng, logger)
     elif noise_type == 'sem_texture':
-        return add_sem_texture_noise(image, params, rng)
+        return add_sem_texture_noise(image, params, rng, logger)
     elif noise_type == 'quantization':
          # Quantization is usually applied last, or just before final bit depth conversion
-         return apply_quantization(image, params, rng)
+         return apply_quantization(image, params, rng, logger)
     elif noise_type == 'blur_noise':
-         return apply_blur_noise(image, params, rng)
+         return apply_blur_noise(image, params, rng, logger)
     # elif noise_type == 'fixed_pattern': -> Handled in instrument stage
     #     return add_fixed_pattern_noise(image, params, rng)
     else:

@@ -38,19 +38,18 @@ def generate_instance_data(warped_semantic_map=None, layer_masks_actual=None):
             if mask_array is not None and isinstance(mask_array, np.ndarray) and mask_array.sum() > 0:
                 valid_layer_masks_present = True
                 break
-
     if valid_layer_masks_present:
         logger.info("Generating instance data from provided layer_masks_actual (assumed warped).")
         # Combine all actual layer masks into one composite mask
-        first_valid_mask = next((m for m in layer_masks_actual.values() if m is not None), None)
+        first_valid_mask = next((m for m in layer_masks_actual.values() if m is not None and m.size > 0), None)
         if first_valid_mask is None:
-            logger.error("No valid masks in layer_masks_actual.")
+            logger.error("No valid (non-None, non-empty) masks in layer_masks_actual.")
             return None, {}
         h, w = first_valid_mask.shape
         composite_actual_mask = np.zeros((h, w), dtype=np.uint8)
         for layer_idx in sorted(layer_masks_actual.keys()):
-            mask = layer_masks_actual[layer_idx]
-            if mask is not None:
+            mask = layer_masks_actual.get(layer_idx) # Use .get() for safety
+            if mask is not None and isinstance(mask, np.ndarray): # Ensure it's an array
                 composite_actual_mask[mask > 0] = 1 # Use 1 temporarily for CC
         binary_map_for_cc = composite_actual_mask
     elif warped_semantic_map is not None and isinstance(warped_semantic_map, np.ndarray):

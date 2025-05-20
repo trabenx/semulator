@@ -10,10 +10,8 @@ except ImportError:
     print("WARNING: 'perlin-noise' library not found. Perlin background disabled.")
 import logging
 
-logger = logging.getLogger(__name__)
 
-
-def generate_background(config, size, magnification, rng):
+def generate_background(config, size, magnification, rng, logger):
     """Generates the background canvas."""
     bg_type = config.get('types')  # Get the type chosen during config randomization
     if not bg_type or not isinstance(bg_type, str): # Check if it's a valid string
@@ -110,8 +108,8 @@ def generate_background(config, size, magnification, rng):
             background.fill(0.2)
         else:
             # Call generate_background recursively
-            bg1 = generate_background(sub_config1, size, magnification, rng)
-            bg2 = generate_background(sub_config2, size, magnification, rng)
+            bg1 = generate_background(sub_config1, size, magnification, rng, logger)
+            bg2 = generate_background(sub_config2, size, magnification, rng, logger)
 
             # Blending logic (same as before)
             if mode == 'additive':

@@ -121,7 +121,7 @@ def run_cli():
     # ---
 
     final_verbose = run_settings.get('verbose', False)
-    final_log_level = logging.INFO  # logging.DEBUG if final_verbose else logging.INFO
+    final_log_level = logging.DEBUG if final_verbose else logging.INFO
     logging.getLogger().setLevel(final_log_level) # Set root logger level
     logger.info(f"Final log level set to: {logging.getLevelName(final_log_level)}")
     if args.show_config:

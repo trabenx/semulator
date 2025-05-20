@@ -2,12 +2,11 @@ import random
 import logging
 from ..core.utils import parse_value
 
-logger = logging.getLogger(__name__)
-
 class Raffler:
-    def __init__(self, raffle_config, rng):
+    def __init__(self, raffle_config, rng, logger):
         self.config = raffle_config
         self.rng = rng
+        self.logger = logger
         self.max_effects = raffle_config.get('max_effects_per_image', 100) # Default high if not set
         self.applied_count = 0
 
@@ -15,7 +14,7 @@ class Raffler:
         """Selects and parameterizes effects for a given category."""
         selected_effects = []
         if category not in self.config.get('categories', {}):
-            logger.warning(f"Raffle category '{category}' not found in config.")
+            self.logger.warning(f"Raffle category '{category}' not found in config.")
             return []
 
         available_effects = self.config['categories'][category]
@@ -46,7 +45,7 @@ class Raffler:
                     }
                     selected_effects.append(effect_instance)
                     self.applied_count += 1
-                    logger.debug(f"Raffled effect '{name}' in category '{category}' with params: {randomized_params}")
+                    self.logger.debug(f"Raffled effect '{name}' in category '{category}' with params: {randomized_params}")
 
         # Determine application order (optional, default to raffle order)
         # Can add logic here based on config if needed.
