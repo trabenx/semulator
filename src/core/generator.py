@@ -10,6 +10,8 @@ from pathlib import Path
 
 from .utils import (get_rng, ensure_dir, normalize_image, image_to_bit_depth,
                     get_distinct_colors, create_color_visualization, parse_value)
+from .constants import SHAPE_TYPE_MAP, NUM_SHAPE_CLASSES
+
 from .configuration import randomize_config_for_sample
 from ..components.background import generate_background
 from ..components.patterns import get_pattern_positions
@@ -26,7 +28,6 @@ from ..components.artifacts.instrument_optical import (apply_psf_blur, apply_def
                                                      apply_charging, apply_topographic_shading,
                                                      apply_gradient_illumination, apply_striping_smearing,
                                                      apply_fixed_pattern_noise, apply_edge_brightness)
-
 from ..outputs.writers import (save_numpy, save_image_data, save_json_data,
                              save_gif_data, save_text_file, calculate_hashes)
 from ..outputs.ground_truth import (generate_instance_data, generate_combined_mask,
@@ -192,6 +193,7 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
         # Initialize global GT maps at OVERSIZED dimensions
         layer_order_map_pre_warp = np.zeros(oversized_shape_for_layers, dtype=np.uint8) if out_opts.get('save_layer_order_map') else None
         semantic_map_pre_warp = np.zeros(oversized_shape_for_layers, dtype=np.uint8) if out_opts.get('save_semantic_map') else None
+        shape_type_semantic_mask_pre_warp = np.zeros(oversized_shape_for_layers, dtype=np.uint8) if out_opts.get('save_shape_type_semantic_mask', False) else None
         individual_layer_actual_masks_pre_warp = {} # Will store final oversized masks for global warping
 
         # --- 3a. Layer Generation Loop ---
@@ -211,6 +213,10 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
             pattern_params = layer_conf.get('pattern_params', {})
             pattern_type = layer_conf.get('pattern', 'grid')
 
+            current_layer_shape_type_str = layer_conf.get('shape', 'unknown_shape_type') # Default if missing
+            current_shape_type_id = SHAPE_TYPE_MAP.get(current_layer_shape_type_str, SHAPE_TYPE_MAP["background"]) # Default to background ID
+            if current_layer_shape_type_str == 'unknown_shape_type':
+                sample_logger.warning(f"Layer {layer_id_name} has unknown shape type, using background ID for semantic mask.")
             layer_shape_artifacts_defs = raff.raffle_effects('shape')
             sample_logger.debug(f"    Raffled shape artifacts for layer: {[a.get('name', 'N/A') for a in layer_shape_artifacts_defs]}")
 
@@ -301,6 +307,10 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
                             if out_opts.get('include_artifact_params_in_metadata', False):
                                 instance_artifact_params_list.append({ 'sample_idx': sample_idx, 'instance_idx_in_layer': idx, 'layer_config_idx': layer_config_idx, 'artifact_name': artifact_name, 'parameters': copy.deepcopy(instance_params) })
                         except Exception as e: sample_logger.error(f"    Error applying mask artifact {artifact_name} to instance {idx}: {e}", exc_info=True)
+
+                if shape_type_semantic_mask_pre_warp is not None and current_shape_type_id != SHAPE_TYPE_MAP["background"]:
+                    # Topmost instance of a shape type wins for that pixel
+                    shape_type_semantic_mask_pre_warp[actual_mask_instance > 0] = current_shape_type_id
 
                 instance_render_clean = np.zeros_like(layer_render_buffer_final_acc)
                 if is_path_based:
@@ -463,6 +473,8 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
         all_maps_and_masks_for_warping = []
         num_general_maps_warped = 0 # Count how many non-layer-specific maps are added
 
+        if shape_type_semantic_mask_pre_warp is not None:
+            all_maps_and_masks_for_warping.append(shape_type_semantic_mask_pre_warp)
         if current_semantic_map_to_warp is not None:
             all_maps_and_masks_for_warping.append(current_semantic_map_to_warp)
             num_general_maps_warped += 1
@@ -526,6 +538,12 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
 
         # Extract and crop warped general maps from the `all_maps_and_masks_for_warping` list
         processed_mask_idx = 0 # Keep track of which mask we are extracting
+        shape_type_semantic_mask_warped = None # Initialize
+        if shape_type_semantic_mask_pre_warp is not None: # Check if it was part of warping
+            if len(all_maps_and_masks_for_warping) > processed_mask_idx and all_maps_and_masks_for_warping[processed_mask_idx] is not None:
+                shape_type_semantic_mask_warped = all_maps_and_masks_for_warping[processed_mask_idx][crop_y_final, crop_x_final]
+            processed_mask_idx += 1
+
         semantic_map_warped = None
         if current_semantic_map_to_warp is not None: # Check if it was part of warping
             if len(all_maps_and_masks_for_warping) > processed_mask_idx and all_maps_and_masks_for_warping[processed_mask_idx] is not None:
@@ -853,6 +871,19 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
                 # The visualization (instance_mask_vis.png) is saved in the "Overlays" section using 'instance_mask_vis_overlay'
             else:
                 sample_logger.warning("final_instance_mask is None, not saving main instance file.")
+
+        # --- Save SHAPE TYPE Semantic Mask ---
+        if out_opts.get('save_shape_type_semantic_mask', False) and shape_type_semantic_mask_warped is not None:
+            path_sts = sample_output_top_dir / "shape_type_semantic_mask.npy"
+            save_numpy(shape_type_semantic_mask_warped, path_sts) # Already uint8
+            add_path('shape_type_semantic_mask_npy', path_sts)
+            if out_opts.get('save_visualizations'):
+                shape_vis_colors = get_distinct_colors(NUM_SHAPE_CLASSES)
+                shape_type_colormap = {i: shape_vis_colors[i % len(shape_vis_colors)] for i in range(NUM_SHAPE_CLASSES)}
+                sts_vis = create_color_visualization(shape_type_semantic_mask_warped, shape_type_colormap)
+                save_image_data(sts_vis, sample_output_top_dir / "shape_type_semantic_mask_vis.png", 8)
+                add_path('shape_type_semantic_mask_vis', sample_output_top_dir / "shape_type_semantic_mask_vis.png")
+
 
         # Layer Order Map
         if out_opts.get('save_layer_order_map', False) and layer_order_map_warped is not None:

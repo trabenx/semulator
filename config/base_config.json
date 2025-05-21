@@ -242,6 +242,7 @@
     "save_clean_layer_renders": true,
 	"save_debug_oversized_warps": true,
 	"save_debug_composition_steps": true,
+    "save_shape_type_semantic_mask": true,
     "include_artifact_params_in_metadata": true,
     "output_formats": {
       "final_image": "tif",

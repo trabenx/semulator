@@ -1,0 +1,8 @@
+torch
+torchvision
+torchaudio
+numpy
+Pillow
+imageio
+scikit-image
+tqdm
