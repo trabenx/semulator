@@ -15,7 +15,7 @@ import time
 
 from unet_model import UNet # Import your U-Net model
 from dataset_loader import SEMDataset # Import your Dataset class
-
+import os
 import sys
 sys.path.append(str(Path(__file__).resolve().parent.parent / 'src' / 'core')) # Add src/core to path
 
@@ -154,7 +154,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, device, e
     logger.info("Training finished.")
 
 
-def infer_single_image(model, image_path, device, target_size=(512, 512), use_tif=False):
+def infer_single_image(model, image_path, device, target_size=(512, 512), use_tif=False, num_classes=None):
     model.eval()
     
     # Load and preprocess image (similar to dataset loader)
@@ -361,61 +361,78 @@ def main():
             logger.info(f"Saved predicted semantic mask (npy) to {output_mask_path_npy}")
 
             # --- Create Colored Visualization of Semantic Prediction ---
+            pred_colormap = {} # Initialize
             try:
-                from src.core.utils import create_color_visualization, get_distinct_colors
+       
+                from utils import create_color_visualization, get_distinct_colors
                 # Use the SHAPE_TYPE_MAP for consistent coloring if possible, or just distinct colors
-                num_colors_to_gen = max(np.max(predicted_mask_np) + 1, NUM_SHAPE_CLASSES)
-                pred_vis_colors = get_distinct_colors(num_colors_to_gen)
-                pred_colormap = {i: pred_vis_colors[i % len(pred_vis_colors)] for i in range(num_colors_to_gen)}
-                predicted_mask_vis_img = create_color_visualization(predicted_mask_np, pred_colormap)
+                num_colors_to_gen = max(np.max(predicted_mask_np) + 1 if predicted_mask_np.size > 0 else 0, NUM_SHAPE_CLASSES) # Handle empty mask
+                if num_colors_to_gen > 0: # Only generate if there are classes
+                    pred_vis_colors = get_distinct_colors(num_colors_to_gen)
+                    pred_colormap = {i: pred_vis_colors[i % len(pred_vis_colors)] for i in range(num_colors_to_gen)}
+                    predicted_mask_vis_img = create_color_visualization(predicted_mask_np, pred_colormap)
 
-                output_mask_vis_path = Path(args.output_dir) / f"{input_filename}_predicted_semantic_mask_vis.png"
-                iio.imwrite(output_mask_vis_path, predicted_mask_vis_img)
-                logger.info(f"Saved predicted semantic mask visualization to {output_mask_vis_path}")
+                    output_mask_vis_path = Path(args.output_dir) / f"{input_filename}_predicted_semantic_mask_vis.png"
+                    iio.imwrite(output_mask_vis_path, predicted_mask_vis_img)
+                    logger.info(f"Saved predicted semantic mask visualization to {output_mask_vis_path}")
+                else:
+                    logger.warning("Predicted mask is empty or has no classes; skipping visualization.")
             except Exception as e_vis:
                  logger.warning(f"Could not create semantic mask visualization: {e_vis}")
 
             # --- Create Overlay on Original Image ---
             try:
-                # Load original image (similar to infer_single_image loading)
+                # Load original image
                 if args.use_tif:
                     original_image_np_load = iio.imread(args.input_image)
-                    # ... (Convert TIF to 8-bit RGB as in infer_single_image) ...
-                else:
+                    # --- *** START IMPLEMENT TIF to 8-bit RGB conversion *** ---
+                    if original_image_np_load.ndim == 2: # Grayscale
+                        original_image_np_load = np.stack([original_image_np_load]*3, axis=-1)
+                    elif original_image_np_load.shape[-1] == 1: # Grayscale with channel dim
+                        original_image_np_load = np.repeat(original_image_np_load, 3, axis=-1)
+                    elif original_image_np_load.shape[-1] == 4: # RGBA
+                        original_image_np_load = original_image_np_load[:,:,:3] # Take RGB
+
+                    # Normalize to 0-255 uint8
+                    if original_image_np_load.dtype == np.uint16:
+                        original_image_np_load = (original_image_np_load / 256).astype(np.uint8)
+                    elif original_image_np_load.dtype != np.uint8:
+                        # Attempt general normalization if not uint16 or uint8
+                        min_val, max_val = np.min(original_image_np_load), np.max(original_image_np_load)
+                        if max_val > min_val:
+                             original_image_np_load = ((original_image_np_load - min_val) / (max_val - min_val) * 255).astype(np.uint8)
+                        else: # Flat image
+                             original_image_np_load = np.full_like(original_image_np_load, 128, dtype=np.uint8) # Mid-gray
+                    # --- *** END IMPLEMENT TIF to 8-bit RGB conversion *** ---
+                else: # PNG
                     original_image_pil_load = Image.open(args.input_image).convert("RGB")
-                    original_image_np_load = np.array(original_image_pil_load)
+                    original_image_np_load = np.array(original_image_pil_load) # Already H,W,3 uint8
 
-                # Ensure original image is H, W, 3 and uint8
-                if original_image_np_load.ndim == 2: original_image_np_load = np.stack([original_image_np_load]*3, axis=-1)
-                if original_image_np_load.shape[-1] == 1: original_image_np_load = np.repeat(original_image_np_load, 3, axis=-1)
-                if original_image_np_load.shape[-1] > 3: original_image_np_load = original_image_np_load[:,:,:3]
-                if original_image_np_load.dtype != np.uint8:
-                    if np.max(original_image_np_load) > 1.0: # Assume scaled 0-255 or 0-65535
-                        original_image_np_load = (original_image_np_load / np.max(original_image_np_load) * 255).astype(np.uint8)
-                    else: # Assume float 0-1
-                         original_image_np_load = (original_image_np_load * 255).astype(np.uint8)
+                # Ensure predicted mask is H,W
+                current_predicted_mask_np = predicted_mask_np
+                if current_predicted_mask_np.ndim == 3 and current_predicted_mask_np.shape[0] == 1: # (1,H,W)
+                    current_predicted_mask_np = current_predicted_mask_np.squeeze(0)
+                elif current_predicted_mask_np.ndim != 2:
+                     raise ValueError(f"Predicted mask has unexpected dimensions: {current_predicted_mask_np.shape}")
 
 
-                # Predicted mask is H, W with class IDs
-                # Create a colored overlay using the same colormap as the visualization
                 overlay_image = original_image_np_load.copy()
                 
-                # Resize original image to match predicted mask's (original) dimensions if they differ
-                # This assumes predicted_mask_np is already resized to original image size
-                if original_image_np_load.shape[:2] != predicted_mask_np.shape[:2]:
+                # Resize original image to match predicted mask's dimensions if they differ
+                # This assumes predicted_mask_np is already at the *original image size* from infer_single_image
+                if original_image_np_load.shape[:2] != current_predicted_mask_np.shape[:2]:
                     from skimage.transform import resize as sk_resize
-                    logger.warning(f"Original image shape {original_image_np_load.shape[:2]} differs from predicted mask shape {predicted_mask_np.shape[:2]}. Resizing original for overlay.")
-                    original_image_np_load = sk_resize(original_image_np_load, predicted_mask_np.shape[:2], preserve_range=True, anti_aliasing=True).astype(np.uint8)
+                    logger.warning(f"Original image shape {original_image_np_load.shape[:2]} differs from predicted mask {current_predicted_mask_np.shape[:2]}. Resizing original for overlay.")
+                    original_image_np_load = sk_resize(original_image_np_load, current_predicted_mask_np.shape[:2], preserve_range=True, anti_aliasing=True).astype(np.uint8)
                     overlay_image = original_image_np_load.copy()
 
-
-                # Alpha for blending
                 alpha_blend = 0.4
-
-                for class_id in range(1, NUM_SHAPE_CLASSES): # Iterate through foreground classes
-                    class_mask_bool = (predicted_mask_np == class_id)
+                # Use the pred_colormap defined earlier (it will be empty if vis failed, but loop won't run if NUM_SHAPE_CLASSES is small)
+                for class_id in range(1, NUM_SHAPE_CLASSES): # Iterate foreground classes
+                    class_mask_bool = (current_predicted_mask_np == class_id)
                     if np.any(class_mask_bool):
-                        color_for_class = pred_colormap.get(class_id, (0,255,0)) # Default green
+                        # Ensure pred_colormap exists and has the key
+                        color_for_class = pred_colormap.get(class_id, (0,255,0) if class_id % 2 == 0 else (255,0,0)) # Default alternating colors
                         overlay_image[class_mask_bool] = (
                             (1 - alpha_blend) * overlay_image[class_mask_bool] +
                             alpha_blend * np.array(color_for_class, dtype=np.uint8)
@@ -426,6 +443,7 @@ def main():
                 logger.info(f"Saved semantic overlay image to {output_overlay_path}")
             except Exception as e_overlay:
                 logger.warning(f"Could not create semantic overlay image: {e_overlay}", exc_info=True)
+
 
 if __name__ == '__main__':
     # Add a small delay to allow logger time to initialize in some environments

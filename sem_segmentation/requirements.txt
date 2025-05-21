@@ -1,7 +1,9 @@
+-i https://download.pytorch.org/whl/cu118
 torch
 torchvision
 torchaudio
 numpy
+opencv-python-headless
 Pillow
 imageio
 scikit-image
