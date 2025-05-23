@@ -2,6 +2,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, random_split
 from pathlib import Path
 import argparse
@@ -85,7 +86,7 @@ def dice_coefficient(pred, target, smooth=1e-6):
     return (2. * intersection + smooth) / (pred_flat.sum() + target_flat.sum() + smooth)
 
 
-def train_model(model, train_loader, val_loader, criterion, optimizer, device, epochs, checkpoint_dir, num_classes):
+def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, device, epochs, checkpoint_dir, num_classes):
     logger.info(f"Starting training for {epochs} epochs on {device} for {num_classes} classes...")
     best_val_dice = 0.0
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -137,6 +138,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, device, e
 
         avg_val_loss = val_loss / len(val_loader)
         avg_val_dice = val_dice / len(val_loader)
+        scheduler.step(avg_val_dice)
         logger.info(f"Epoch {epoch+1} - Val Loss: {avg_val_loss:.4f}, Val Dice: {avg_val_dice:.4f}")
 
         if avg_val_dice > best_val_dice:
@@ -209,80 +211,85 @@ def infer_single_image(model, image_path, device, target_size=(512, 512), use_ti
     return predicted_mask_np
 
 
-def check_cuda_availability_details():
+def check_cuda_availability_details(chosen_device_str=None):
     """Prints details about CUDA availability and potential issues."""
-    logger.info("--- Checking CUDA Availability Details ---")
+    logger.info("--- Checking CUDA/Device Availability Details ---")
     try:
-        if not torch.cuda.is_available():
-            logger.warning("torch.cuda.is_available() returned False. CUDA is not available.")
+        if chosen_device_str == "cuda":
+            if not torch.cuda.is_available():
+                logger.error("User explicitly chose 'cuda', but torch.cuda.is_available() is False.")
 
-            # 1. Check if PyTorch was compiled with CUDA support
-            pytorch_cuda_version = torch.version.cuda
-            if pytorch_cuda_version is None:
-                logger.warning("PyTorch was likely NOT compiled with CUDA support (torch.version.cuda is None).")
-                logger.warning("Ensure you installed a PyTorch version with CUDA (e.g., from pytorch.org for your CUDA version).")
-            else:
-                logger.info(f"PyTorch was compiled with CUDA version: {pytorch_cuda_version}")
-
-            # 2. Check CUDA driver version (requires nvidia-smi, might not be available or on PATH)
-            try:
-                import subprocess
-                result = subprocess.run(['nvidia-smi', '--query-gpu=driver_version', '--format=csv,noheader'], capture_output=True, text=True, check=False)
-                if result.returncode == 0 and result.stdout.strip():
-                    driver_version = result.stdout.strip()
-                    logger.info(f"NVIDIA driver version found: {driver_version}")
+                # 1. Check if PyTorch was compiled with CUDA support
+                pytorch_cuda_version = torch.version.cuda
+                if pytorch_cuda_version is None:
+                    logger.warning("PyTorch was likely NOT compiled with CUDA support (torch.version.cuda is None).")
                 else:
-                    logger.warning("Could not run 'nvidia-smi' to check driver version. Is it installed and in PATH?")
-                    if result.stderr:
-                         logger.warning(f"nvidia-smi error: {result.stderr.strip()}")
-            except FileNotFoundError:
-                logger.warning("'nvidia-smi' command not found. Ensure NVIDIA drivers are installed and nvidia-smi is in PATH.")
-            except Exception as e_smi:
-                logger.warning(f"Error running nvidia-smi: {e_smi}")
+                    logger.info(f"PyTorch was compiled with CUDA version: {pytorch_cuda_version}")
+                try:
+                    device_count = torch.cuda.device_count()
+                    logger.info(f"torch.cuda.device_count(): {device_count}")
+                except Exception as e:
+                    logger.warning(f"Error calling torch.cuda.device_count(): {e}")
 
+                # 2. Check CUDA driver version (requires nvidia-smi, might not be available or on PATH)
+                try:
+                    import subprocess
+                    result = subprocess.run(['nvidia-smi', '--query-gpu=driver_version', '--format=csv,noheader'], capture_output=True, text=True, check=False)
+                    if result.returncode == 0 and result.stdout.strip():
+                        driver_version = result.stdout.strip()
+                        logger.info(f"NVIDIA driver version found: {driver_version}")
+                    else:
+                        logger.warning("Could not run 'nvidia-smi' to check driver version. Is it installed and in PATH?")
+                        if result.stderr:
+                             logger.warning(f"nvidia-smi error: {result.stderr.strip()}")
+                except FileNotFoundError:
+                    logger.warning("'nvidia-smi' command not found. Ensure NVIDIA drivers are installed and nvidia-smi is in PATH.")
+                except Exception as e_smi:
+                    logger.warning(f"Error running nvidia-smi: {e_smi}")
 
-            # 3. Check number of CUDA devices found by PyTorch
-            # This might still be 0 even if PyTorch has CUDA, if drivers/toolkit are mismatched or no compatible GPU.
-            try:
-                device_count = torch.cuda.device_count()
-                logger.info(f"torch.cuda.device_count() returned: {device_count}")
-                if device_count == 0 and pytorch_cuda_version is not None:
-                    logger.warning("PyTorch sees 0 CUDA devices, even though compiled with CUDA.")
-                    logger.warning("Possible reasons: NVIDIA driver issue, CUDA toolkit mismatch with driver, or no compatible GPU found.")
-                for i in range(device_count):
-                    logger.info(f"  Device {i}: {torch.cuda.get_device_name(i)}")
-            except Exception as e_dev_count:
-                logger.error(f"Error checking CUDA devices with PyTorch: {e_dev_count}")
-                logger.warning("This might indicate a more severe problem with the CUDA setup or PyTorch installation.")
+                # 3. Check number of CUDA devices found by PyTorch
+                # This might still be 0 even if PyTorch has CUDA, if drivers/toolkit are mismatched or no compatible GPU.
+                try:
+                    device_count = torch.cuda.device_count()
+                    logger.info(f"torch.cuda.device_count() returned: {device_count}")
+                    if device_count == 0 and pytorch_cuda_version is not None:
+                        logger.warning("PyTorch sees 0 CUDA devices, even though compiled with CUDA.")
+                        logger.warning("Possible reasons: NVIDIA driver issue, CUDA toolkit mismatch with driver, or no compatible GPU found.")
+                    for i in range(device_count):
+                        logger.info(f"  Device {i}: {torch.cuda.get_device_name(i)}")
+                except Exception as e_dev_count:
+                    logger.error(f"Error checking CUDA devices with PyTorch: {e_dev_count}")
+                    logger.warning("This might indicate a more severe problem with the CUDA setup or PyTorch installation.")
 
+                # 4. Check CUDA_VISIBLE_DEVICES environment variable
+                cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
+                if cuda_visible_devices:
+                    logger.info(f"Environment variable CUDA_VISIBLE_DEVICES is set to: '{cuda_visible_devices}'.")
+                    if cuda_visible_devices == "-1":
+                        logger.warning("CUDA_VISIBLE_DEVICES=-1 typically disables all GPUs for CUDA applications.")
+                else:
+                    logger.info("Environment variable CUDA_VISIBLE_DEVICES is not set (or empty).")
+                return False
 
-            # 4. Check CUDA_VISIBLE_DEVICES environment variable
-            cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
-            if cuda_visible_devices:
-                logger.info(f"Environment variable CUDA_VISIBLE_DEVICES is set to: '{cuda_visible_devices}'.")
-                if cuda_visible_devices == "-1":
-                    logger.warning("CUDA_VISIBLE_DEVICES=-1 typically disables all GPUs for CUDA applications.")
             else:
-                logger.info("Environment variable CUDA_VISIBLE_DEVICES is not set (or empty).")
-            
-            logger.info("Common reasons for CUDA not being available:")
-            logger.info("  1. NVIDIA drivers not installed or not compatible with the CUDA toolkit.")
-            logger.info("  2. CUDA Toolkit not installed or not compatible with the NVIDIA drivers.")
-            logger.info("  3. PyTorch installed without CUDA support (e.g., CPU-only version).")
-            logger.info("  4. CUDA_VISIBLE_DEVICES environment variable hiding the GPU(s).")
-            logger.info("  5. Hardware issues with the GPU.")
-            logger.info("Please verify your NVIDIA driver, CUDA Toolkit, and PyTorch installation.")
-
-            return False
-        else:
-            logger.info("torch.cuda.is_available() returned True. CUDA should be available.")
-            device_count = torch.cuda.device_count()
-            logger.info(f"Number of CUDA devices found: {device_count}")
-            for i in range(device_count):
-                logger.info(f"  Device {i}: {torch.cuda.get_device_name(i)} (CUDA Capability: {torch.cuda.get_device_capability(i)})")
-            current_device_idx = torch.cuda.current_device()
-            logger.info(f"Current CUDA device index: {current_device_idx}")
-            return True
+                logger.info("torch.cuda.is_available() returned True. CUDA should be available.")
+                device_count = torch.cuda.device_count()
+                logger.info(f"Number of CUDA devices found: {device_count}")
+                for i in range(device_count):
+                    logger.info(f"  Device {i}: {torch.cuda.get_device_name(i)} (CUDA Capability: {torch.cuda.get_device_capability(i)})")
+                current_device_idx = torch.cuda.current_device()
+                logger.info(f"Current CUDA device index: {current_device_idx}")
+                return True
+        elif chosen_device_str == "cpu":
+            logger.info("User explicitly chose 'cpu'.")
+            return False # Indicates CUDA should not be used
+        else: # Auto-detection
+            if not torch.cuda.is_available():
+                logger.warning("torch.cuda.is_available() returned False (auto-detection). CUDA is not available.")
+                return False # CUDA not available
+            else:
+                logger.info("torch.cuda.is_available() returned True (auto-detection). CUDA will be used.")
+                return True # CUDA available
     except Exception as e:
         logger.error(f"An unexpected error occurred during CUDA availability check: {e}", exc_info=True)
         return False
@@ -302,22 +309,50 @@ def main():
     parser.add_argument('--model_path', type=str, help="Path to a trained model checkpoint for inference")
     parser.add_argument('--input_image', type=str, help="Path to a single image for inference")
     parser.add_argument('--output_dir', type=str, default='./results', help="Directory to save inference results")
+    parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cuda', 'cpu'], help="Device to use: 'auto' (try CUDA, fallback to CPU), 'cuda' (force CUDA), 'cpu' (force CPU).")
 
     args = parser.parse_args()
 
-    # --- Determine device (CUDA or CPU) with detailed check ---
-    cuda_is_ready = check_cuda_availability_details()
-    if cuda_is_ready:
-        device = torch.device("cuda")
-    else:
+    # --- Setup Basic Logging (if not already configured globally) ---
+    if not logger.handlers: # Configure only if no handlers are already set
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+    # --- Determine device (CUDA or CPU) with detailed check and user choice ---
+    chosen_device_cli = args.device.lower() # User's choice from CLI
+    
+    if chosen_device_cli == "cuda":
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+            logger.info("CUDA selected by user and available.")
+            check_cuda_availability_details("cuda") # Log details
+        else:
+            logger.error("User selected 'cuda' but CUDA is not available! Please check setup. Falling back to CPU.")
+            check_cuda_availability_details("cuda") # Log details about why it's not available
+            device = torch.device("cpu")
+    elif chosen_device_cli == "cpu":
         device = torch.device("cpu")
-    logger.info(f"--- Using device: {device} ---") # This will now print after the detailed check
+        logger.info("CPU selected by user.")
+        check_cuda_availability_details("cpu") # Log (will confirm no CUDA attempt)
+    else: # 'auto' mode
+        cuda_is_ready_auto = check_cuda_availability_details() # This will print detailed info
+        if cuda_is_ready_auto:
+            device = torch.device("cuda")
+        else:
+            device = torch.device("cpu")
+    logger.info(f"--- Using device: {device} ---")
     # ---
 
-    logger.info(f"Using device: {device}")
-    logger.info(f"Number of shape classes (including background): {NUM_SHAPE_CLASSES}")
-
     target_size_tuple = (args.img_size, args.img_size)
+    # --- Ensure constants are loaded (NUM_SHAPE_CLASSES) ---
+    # This path adjustment assumes constants.py is in ../src/core relative to train_infer.py
+    sys.path.append(str(Path(__file__).resolve().parent.parent / 'src' / 'core'))
+    try:
+        from constants import SHAPE_TYPE_MAP, NUM_SHAPE_CLASSES
+        logger.info(f"Number of shape classes (including background): {NUM_SHAPE_CLASSES}")
+    except ImportError:
+        logger.error("Could not import SHAPE_TYPE_MAP, NUM_SHAPE_CLASSES from constants.")
+        return
+    # ---
 
     if args.mode == 'train':
         Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
@@ -328,14 +363,15 @@ def main():
         train_size = len(dataset) - val_size
         train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
 
-        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True)
-        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=(device.type == 'cuda'))
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=(device.type == 'cuda'))
 
         model = UNet(n_channels=1, n_classes=NUM_SHAPE_CLASSES).to(device)
         
         criterion = nn.CrossEntropyLoss() # For multi-class semantic segmentation
         optimizer = optim.Adam(model.parameters(), lr=args.lr)
-        train_model(model, train_loader, val_loader, criterion, optimizer, device, args.epochs, Path(args.checkpoint_dir), NUM_SHAPE_CLASSES)
+        scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=5, verbose=True) # Reduce LR if val_dice doesn't improve for 5 epochs
+        train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, device, args.epochs, Path(args.checkpoint_dir), NUM_SHAPE_CLASSES)
 
     elif args.mode == 'infer':
         if not args.model_path or not args.input_image:

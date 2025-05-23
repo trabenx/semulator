@@ -152,6 +152,8 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
 
         geom_mode = artifact_raffle_settings.get('per_instance_geometric_mode', 'none') # Default to none
         out_opts = sample_config.get('output_options', {})
+        run_settings = sample_config.get('run_settings', {}) # Get run_settings
+        max_predictable_layers_for_gt = run_settings.get('max_predictable_layers', 5) # Get from config
         sample_logger.info(f"Image Size: {final_h}x{final_w}, Bit Depth: {bit_depth}, Magnification: {magnification:.2f}x")
         sample_logger.info(f"Per-instance Geometric Mode: {geom_mode}")
 
@@ -194,7 +196,11 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
         layer_order_map_pre_warp = np.zeros(oversized_shape_for_layers, dtype=np.uint8) if out_opts.get('save_layer_order_map') else None
         semantic_map_pre_warp = np.zeros(oversized_shape_for_layers, dtype=np.uint8) if out_opts.get('save_semantic_map') else None
         shape_type_semantic_mask_pre_warp = np.zeros(oversized_shape_for_layers, dtype=np.uint8) if out_opts.get('save_shape_type_semantic_mask', False) else None
+        # For "X-Ray" vision: list to hold individual semantic masks for each layer
+        per_layer_shape_type_semantic_masks_pre_warp = [] if out_opts.get('save_per_layer_shape_type_semantic_masks') else None        
+        
         individual_layer_actual_masks_pre_warp = {} # Will store final oversized masks for global warping
+
 
         # --- 3a. Layer Generation Loop ---
         sample_logger.info(f"Processing {len(selected_layers)} selected layers on {current_w}x{current_h} canvas...")
@@ -248,6 +254,10 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
             layer_combined_mask_actual_acc = np.zeros(oversized_shape_for_layers, dtype=np.uint8)
             layer_render_buffer_final_acc = np.zeros(oversized_shape_for_layers, dtype=np.float32)
             layer_render_buffer_clean_acc = np.zeros(oversized_shape_for_layers, dtype=np.float32)
+            # --- NEW: Semantic mask for THIS specific layer ---
+            current_layer_semantic_mask_acc = np.zeros(oversized_shape_for_layers, dtype=np.uint8) \
+                if per_layer_shape_type_semantic_masks_pre_warp is not None else None
+
             num_instances_in_layer = 0
             applied_shape_artifacts_names_layer = set()
 
@@ -307,6 +317,17 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
                             if out_opts.get('include_artifact_params_in_metadata', False):
                                 instance_artifact_params_list.append({ 'sample_idx': sample_idx, 'instance_idx_in_layer': idx, 'layer_config_idx': layer_config_idx, 'artifact_name': artifact_name, 'parameters': copy.deepcopy(instance_params) })
                         except Exception as e: sample_logger.error(f"    Error applying mask artifact {artifact_name} to instance {idx}: {e}", exc_info=True)
+
+                # --- Update Semantic Masks ---
+                if actual_mask_instance is not None and np.sum(actual_mask_instance) > 0:
+                    if shape_type_semantic_mask_pre_warp is not None and current_shape_type_id != SHAPE_TYPE_MAP["background"]:
+                        shape_type_semantic_mask_pre_warp[actual_mask_instance > 0] = current_shape_type_id # Topmost wins
+
+                    if current_layer_semantic_mask_acc is not None and current_shape_type_id != SHAPE_TYPE_MAP["background"]:
+                        # For per-layer semantic mask, accumulate all shapes of this layer
+                        current_layer_semantic_mask_acc[actual_mask_instance > 0] = current_shape_type_id
+                # ---
+
 
                 if shape_type_semantic_mask_pre_warp is not None and current_shape_type_id != SHAPE_TYPE_MAP["background"]:
                     # Topmost instance of a shape type wins for that pixel
@@ -378,6 +399,13 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
             individual_layer_actual_masks_pre_warp[layer_config_idx] = layer_combined_mask_final_actual.copy()
 
             if layer_order_map_pre_warp is not None: layer_order_map_pre_warp[layer_combined_mask_final_actual > 0] = layer_render_idx + 1
+            # --- Add current layer's semantic mask to the list ---
+            if per_layer_shape_type_semantic_masks_pre_warp is not None:
+                if current_layer_semantic_mask_acc is not None:
+                    per_layer_shape_type_semantic_masks_pre_warp.append(current_layer_semantic_mask_acc.copy())
+                else: # Should not happen if main flag is true
+                    per_layer_shape_type_semantic_masks_pre_warp.append(np.zeros(oversized_shape_for_layers, dtype=np.uint8))
+
             if semantic_map_pre_warp is not None: semantic_map_pre_warp[layer_combined_mask_final_actual > 0] = layer_config_idx + 1
 
             layer_render_buffer_final_acc = np.clip(layer_render_buffer_final_acc, 0.0, 1.0)
@@ -420,6 +448,13 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
                  save_image_data(all_layers_data[layer_config_idx]['render_final_oversized'][crop_y_final_save, crop_x_final_save], layer_output_dir / "render_final_vis.png", bit_depth)
         # --- End Layer Loop ---
         sample_logger.info("Finished processing all layers (on oversized canvas).")
+        if per_layer_shape_type_semantic_masks_pre_warp is not None:
+            num_generated_layers = len(per_layer_shape_type_semantic_masks_pre_warp)
+            for _ in range(num_generated_layers, max_predictable_layers_for_gt):
+                per_layer_shape_type_semantic_masks_pre_warp.append(np.zeros(oversized_shape_for_layers, dtype=np.uint8))
+            # Truncate if more layers were generated than max_predictable (less common)
+            per_layer_shape_type_semantic_masks_pre_warp = per_layer_shape_type_semantic_masks_pre_warp[:max_predictable_layers_for_gt]
+
         
         # --- 4. Compose Layers ---
         # image_clean is already oversized and started with background
@@ -481,6 +516,14 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
         if current_layer_order_map_to_warp is not None:
             all_maps_and_masks_for_warping.append(current_layer_order_map_to_warp)
             num_general_maps_warped += 1
+
+        # Add per-layer semantic masks (if generating them)
+        num_per_layer_semantic_masks_warped = 0
+        if per_layer_shape_type_semantic_masks_pre_warp is not None:
+            for pl_sem_mask in per_layer_shape_type_semantic_masks_pre_warp: # Should be padded to max_predictable_layers
+                all_maps_and_masks_for_warping.append(pl_sem_mask)
+            num_per_layer_semantic_masks_warped = len(per_layer_shape_type_semantic_masks_pre_warp)
+
 
         # Add individual layer actual masks (these are final post-layer-artifacts, oversized)
         # Ensure a consistent order for adding and later extracting these
@@ -554,6 +597,17 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
             if len(all_maps_and_masks_for_warping) > processed_mask_idx and all_maps_and_masks_for_warping[processed_mask_idx] is not None:
                 layer_order_map_warped = all_maps_and_masks_for_warping[processed_mask_idx][crop_y_final, crop_x_final]
             processed_mask_idx += 1
+
+        # Extract per-layer semantic masks
+        warped_per_layer_shape_type_semantic_masks = []
+        if per_layer_shape_type_semantic_masks_pre_warp is not None:
+            for i in range(num_per_layer_semantic_masks_warped):
+                if len(all_maps_and_masks_for_warping) > processed_mask_idx and all_maps_and_masks_for_warping[processed_mask_idx] is not None:
+                    warped_per_layer_shape_type_semantic_masks.append(all_maps_and_masks_for_warping[processed_mask_idx][crop_y_final, crop_x_final])
+                else: # Append an empty mask if something went wrong
+                    warped_per_layer_shape_type_semantic_masks.append(np.zeros((final_h, final_w), dtype=np.uint8))
+                processed_mask_idx += 1
+
 
         # Extract and crop warped individual layer masks
         warped_individual_layer_masks = {} # Stores CROPPED warped individual layer masks
@@ -871,6 +925,36 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
                 # The visualization (instance_mask_vis.png) is saved in the "Overlays" section using 'instance_mask_vis_overlay'
             else:
                 sample_logger.warning("final_instance_mask is None, not saving main instance file.")
+
+        # --- Save Per-Layer Shape Type Semantic Masks ---
+        if out_opts.get('save_per_layer_shape_type_semantic_masks', False) and warped_per_layer_shape_type_semantic_masks:
+            for i, layer_sem_mask_warped in enumerate(warped_per_layer_shape_type_semantic_masks):
+                # Only save up to the actual number of layers generated for this sample,
+                # or up to max_predictable_layers if that's how the list was padded
+                # Let's use number of selected_layers
+                if i < len(selected_layers): # Match original layer index
+                    # Find original layer_config_idx based on render order if layers were shuffled
+                    original_cfg_idx = layer_indices[i] # Use the i-th element from the (possibly shuffled) render order
+                    layer_id_for_filename = all_layers_data.get(original_cfg_idx, {}).get('id', f'layer_{original_cfg_idx:02d}')
+
+                    path_pls = sample_output_top_dir / "layers" / f"layer_{original_cfg_idx:02d}" / f"shape_type_semantic_mask.npy"
+                    ensure_dir(path_pls.parent) # Ensure layer_XX dir exists
+                    save_numpy(layer_sem_mask_warped, path_pls)
+                    add_path(f'layer_{original_cfg_idx:02d}_shape_type_semantic_mask_npy', path_pls)
+
+                    if out_opts.get('save_visualizations'):
+                        shape_vis_colors = get_distinct_colors(NUM_SHAPE_CLASSES)
+                        shape_type_colormap = {k: shape_vis_colors[k % len(shape_vis_colors)] for k in range(NUM_SHAPE_CLASSES)}
+                        pls_vis = create_color_visualization(layer_sem_mask_warped, shape_type_colormap)
+                        save_image_data(pls_vis, path_pls.with_suffix(".png"), 8)
+                        add_path(f'layer_{original_cfg_idx:02d}_shape_type_semantic_mask_vis', path_pls.with_suffix(".png"))
+                elif i < max_predictable_layers_for_gt: # Save empty masks for padding if needed by training
+                    path_pls_empty = sample_output_top_dir / "layers" / f"layer_padding_{i:02d}" / f"shape_type_semantic_mask.npy"
+                    ensure_dir(path_pls_empty.parent)
+                    save_numpy(layer_sem_mask_warped, path_pls_empty) # Save the zero mask
+                    # Don't necessarily add these padding masks to metadata output_paths unless useful
+
+
 
         # --- Save SHAPE TYPE Semantic Mask ---
         if out_opts.get('save_shape_type_semantic_mask', False) and shape_type_semantic_mask_warped is not None:
