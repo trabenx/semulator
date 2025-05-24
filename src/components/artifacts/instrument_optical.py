@@ -204,7 +204,7 @@ def apply_topographic_shading(image, layers_data, params, rng, logger):
         sorted_indices = sorted(layers_data.keys())
         current_height = 0.0
         for idx in sorted_indices:
-            mask = layers_data[idx]['actual_mask'] # Use actual mask post-shape artifacts
+            mask = layers_data[idx]['actual_mask_warped'] # Use actual mask post-shape artifacts
             current_height += layer_height_step
             height_map[mask > 0] = current_height
         # Normalize height map 0-1

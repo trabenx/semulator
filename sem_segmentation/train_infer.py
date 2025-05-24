@@ -51,44 +51,105 @@ class DiceLoss(nn.Module):
 
 
 # --- Multi-class Dice for "X-Ray" output ---
-def dice_coefficient_xray(model_outputs_flat, target_masks_stacked, num_shape_classes, max_layers, smooth=1e-6):
-    # model_outputs_flat: (B, max_layers * num_shape_classes, H, W)
-    # target_masks_stacked: (B, max_layers, H, W) - with class indices
-    if num_shape_classes <= 1 or max_layers == 0: return torch.tensor(0.0)
+def dice_coefficient_xray(model_outputs_flat, target_masks_stacked, epoch, num_shape_classes, max_layers, smooth=1e-5): # Increased smooth slightly
+    # model_outputs_flat: (B, max_layers * num_shape_classes, H, W) - logits
+    # target_masks_stacked: (B, max_layers, H, W) - with class indices (long)
+
+    if num_shape_classes <= 1 or max_layers == 0:
+        return torch.tensor(0.0, device=model_outputs_flat.device) # Ensure tensor is on correct device
 
     B, _, H, W = model_outputs_flat.shape
     
     # Reshape model output: (B, max_layers, num_shape_classes, H, W)
     model_outputs_reshaped = model_outputs_flat.view(B, max_layers, num_shape_classes, H, W)
     
-    total_dice = 0.0
-    active_layers_count_for_dice = 0
+    total_dice_score_for_batch = 0.0
+    num_active_layers_in_batch = 0 # Count layers with foreground GT for averaging
 
-    for l in range(max_layers):
-        layer_logits = model_outputs_reshaped[:, l, :, :, :] # B, num_shape_classes, H, W
-        layer_targets = target_masks_stacked[:, l, :, :]   # B, H, W
+    # --- Debug: Check input shapes and types once ---
+    if not hasattr(dice_coefficient_xray, 'logged_shapes'):
+        logger.debug(f"Dice - model_outputs_flat shape: {model_outputs_flat.shape}, dtype: {model_outputs_flat.dtype}")
+        logger.debug(f"Dice - target_masks_stacked shape: {target_masks_stacked.shape}, dtype: {target_masks_stacked.dtype}")
+        logger.debug(f"Dice - model_outputs_reshaped shape: {model_outputs_reshaped.shape}")
+        dice_coefficient_xray.logged_shapes = True
 
-        # Only calculate Dice for layers that have actual content (not all background)
-        if torch.any(layer_targets != SHAPE_TYPE_MAP.get("background", 0)):
-            layer_pred_probs = torch.softmax(layer_logits, dim=1)
-            layer_pred_labels = torch.argmax(layer_pred_probs, dim=1) # B, H, W
 
-            dice_per_class_this_layer = []
-            for c in range(num_shape_classes):
-                if c == SHAPE_TYPE_MAP.get("background", 0): continue # Skip background
+    for l_idx in range(max_layers):
+        layer_logits = model_outputs_reshaped[:, l_idx, :, :, :] # B, num_shape_classes, H, W
+        layer_targets = target_masks_stacked[:, l_idx, :, :]   # B, H, W (long)
 
-                pred_c = (layer_pred_labels == c).float().view(B, -1)
-                target_c = (layer_targets == c).float().view(B, -1)
+        # Only calculate Dice for layers that have actual foreground content in the target
+        # This prevents penalizing for empty GT layers if model predicts something.
+        # SHAPE_TYPE_MAP.get("background", 0) should be the ID for background class.
+        background_class_id = SHAPE_TYPE_MAP.get("background", 0)
 
-                intersection = (pred_c * target_c).sum(dim=1)
-                score = (2. * intersection + smooth) / (pred_c.sum(dim=1) + target_c.sum(dim=1) + smooth)
-                dice_per_class_this_layer.append(score.mean()) # Mean dice for this class across batch
+        # --- DEBUG: Check target content for this layer ---
+        # This should be done for each item in batch, but for first item is a good start
+        has_foreground_gt = torch.any(layer_targets[0] != background_class_id)
+        logger.debug(f"Dice - BatchItem 0, Layer {l_idx}: Has FG in GT? {has_foreground_gt}. Unique GT labels: {torch.unique(layer_targets[0]).cpu().numpy()}")
+        # ---
+        
+        if not torch.any(layer_targets != background_class_id):
+            logger.debug(f"Dice - Layer {l_idx}: All background in target batch, skipping Dice for this layer.")
+            continue
+        num_active_layers_in_batch += 1
 
-            if dice_per_class_this_layer:
-                total_dice += torch.mean(torch.stack(dice_per_class_this_layer))
-                active_layers_count_for_dice += 1
+        # Get predicted class labels for this layer
+        layer_pred_probs = torch.softmax(layer_logits, dim=1) # (B, num_shape_classes, H, W)
+        layer_pred_labels = torch.argmax(layer_pred_probs, dim=1) # (B, H, W) with predicted class indices
+
+        # --- Debug: Check labels ---
+        if not hasattr(dice_coefficient_xray, f'logged_layer_{l_idx}'):
+            logger.debug(f"Dice - Layer {l_idx} - Unique target labels: {torch.unique(layer_targets)}")
+            logger.debug(f"Dice - Layer {l_idx} - Unique predicted labels: {torch.unique(layer_pred_labels)}")
+            setattr(dice_coefficient_xray, f'logged_layer_{l_idx}', True)
+
+        dice_per_class_this_layer_batch = [] # Store Dice for each class for this layer and batch
+
+        for c in range(num_shape_classes):
+            if c == background_class_id: # Typically skip background class for Dice
+                continue
+
+            # Create binary masks for the current class c
+            pred_c = (layer_pred_labels == c).float() # (B, H, W)
+            target_c = (layer_targets == c).float()   # (B, H, W)
+
+            # Flatten for intersection/sum calculation
+            pred_c_flat = pred_c.contiguous().view(B, -1)
+            target_c_flat = target_c.contiguous().view(B, -1)
+
+            intersection = (pred_c_flat * target_c_flat).sum(dim=1) # Sum over pixels for each item in batch
+            sum_pred = pred_c_flat.sum(dim=1)
+            sum_target = target_c_flat.sum(dim=1)
+            
+            # Dice score for class c, for each item in batch
+            dice_score_class_batch = (2. * intersection + smooth) / (sum_pred + sum_target + smooth)
+            
+            # --- Debug: Check sums and intersection for a specific problematic class/layer ---
+            if c == 1 and l_idx == 0 and epoch < 2: # Example: log for class 1, layer 0 in early epochs
+                logger.debug(f"Epoch {epoch}, L{l_idx}, C{c} - Intersection: {intersection.cpu().numpy()}, SumPred: {sum_pred.cpu().numpy()}, SumTarget: {sum_target.cpu().numpy()}, Dice: {dice_score_class_batch.cpu().numpy()}")
+
+            # Only consider Dice if the target actually has this class present (optional, but good for sparse classes)
+            # If target_c.sum(dim=1) is 0 for an item, its Dice will be smooth / (pred.sum + smooth) which is low.
+            # If both pred_c and target_c sum to 0, Dice is 1 (smooth/smooth). We want to avoid this.
+            # We can average Dice scores for classes present in the target or average all.
+            # For now, average all (non-background) per-class Dice scores for this layer.
+            dice_per_class_this_layer_batch.append(dice_score_class_batch) # List of tensors, each (B,)
+
+        if dice_per_class_this_layer_batch:
+            # Stack and then mean over classes, then mean over batch
+            avg_dice_this_layer_batch = torch.mean(torch.stack(dice_per_class_this_layer_batch, dim=0).mean(dim=1))
+            total_dice_score_for_batch += avg_dice_this_layer_batch
+        else:
+            logger.debug(f"Dice - Layer {l_idx}: No foreground classes found in target, or all classes skipped.")
+
+
+    # Average Dice score over active layers in the batch
+    final_batch_dice = total_dice_score_for_batch / num_active_layers_in_batch if num_active_layers_in_batch > 0 else torch.tensor(0.0, device=model_outputs_flat.device)
     
-    return total_dice / active_layers_count_for_dice if active_layers_count_for_dice > 0 else torch.tensor(0.0)
+    # --- Debug: Final Dice for batch ---
+    logger.debug(f"Dice - Final Batch Dice: {final_batch_dice.item():.4f}, Active Layers: {num_active_layers_in_batch}")
+    return final_batch_dice
 
 
 # --- Multi-class Dice Coefficient (Example: Macro Average) ---
@@ -163,7 +224,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
 
             # Dice coefficient is calculated on the full flat output and stacked targets
             # (dice_coefficient_xray should handle reshaping internally)
-            current_batch_dice = dice_coefficient_xray(outputs_flat, target_masks_stacked, num_shape_classes, max_layers)
+            current_batch_dice = dice_coefficient_xray(outputs_flat, target_masks_stacked, epoch, num_shape_classes, max_layers)
 
             current_batch_loss.backward() # Backpropagate the averaged loss
             optimizer.step()
@@ -198,7 +259,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                 current_batch_loss_val = batch_total_loss_val / max_layers if max_layers > 0 else batch_total_loss_val
                 # ---
 
-                current_batch_dice_val = dice_coefficient_xray(outputs_flat, target_masks_stacked, num_shape_classes, max_layers)
+                current_batch_dice_val = dice_coefficient_xray(outputs_flat, target_masks_stacked, epoch, num_shape_classes, max_layers)
                 
                 val_loss += current_batch_loss_val.item()
                 val_dice += current_batch_dice_val.item() # .item() if dice is a tensor

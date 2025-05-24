@@ -7,6 +7,11 @@ import random
 from pathlib import Path
 from torch.utils.data import Dataset
 import imageio.v3 as iio
+
+import sys
+sys.path.append(str(Path(__file__).resolve().parent.parent / 'src' / 'core')) # Add src/core to path
+from constants import SHAPE_TYPE_MAP
+
 import logging
 
 logger = logging.getLogger(__name__)
@@ -94,40 +99,35 @@ class SEMDataset(Dataset):
         # Load into a list of numpy arrays first
         loaded_layer_masks_np = []
         original_mask_shape = None # Store shape from first valid mask
+        # Determine original H, W from image first, if possible
+        if image is not None:
+            original_mask_shape = (image.shape[0], image.shape[1])
+        else: # Fallback if image loading failed, less ideal
+            original_mask_shape = self.target_size # This might be problematic if target_size isn't original
 
         for i in range(self.max_layers_to_load):
             # Try to find the layer's specific semantic mask
             # Path construction depends on how generator saves them (e.g., in the layer_XX subdir)
-            mask_file_name = f"layer_{i:02d}_shape_type_semantic_mask.npy" # Name used in generator proposal
+            mask_file_name = f"shape_type_semantic_mask.npy" # Name used in generator proposal
             mask_path = sample_dir / "layers" / f"layer_{i:02d}" / mask_file_name
 
             if mask_path.is_file():
                 try:
-                    layer_mask_np = np.load(mask_path).astype(np.int64) # H, W
+                    layer_mask_np = np.load(mask_path).astype(np.int64)
+                    if original_mask_shape is None: original_mask_shape = layer_mask_np.shape
+                    # Ensure loaded mask has expected shape before appending
+                    if layer_mask_np.shape != original_mask_shape:
+                         logger.warning(f"Mask {mask_path} shape {layer_mask_np.shape} mismatch, expected {original_mask_shape}. Resizing/Padding.")
+                         # Simplistic resize/pad - may need more robust handling
+                         temp_pil = Image.fromarray(layer_mask_np.astype(np.uint8), mode='L')
+                         temp_pil_resized = TF.resize(temp_pil, list(original_mask_shape), interpolation=TF.InterpolationMode.NEAREST)
+                         layer_mask_np = np.array(temp_pil_resized, dtype=np.int64)
                     loaded_layer_masks_np.append(layer_mask_np)
-                    if original_mask_shape is None:
-                        original_mask_shape = layer_mask_np.shape
                 except Exception as e:
                     logger.warning(f"Error loading layer mask {mask_path} for sample {sample_dir.name}: {e}. Using empty mask.")
-                    # If a mask file for a layer slot is missing or corrupt, add an empty mask
-                    if original_mask_shape: # Use shape from a previously loaded mask
-                         loaded_layer_masks_np.append(np.zeros(original_mask_shape, dtype=np.int64))
-                    # else: # No masks loaded yet to get shape, this is an issue. How to get H,W?
-                    # For now, assume at least one mask will load to set original_mask_shape.
-                    # A better way is to get H,W from the input image.
+                    loaded_layer_masks_np.append(np.zeros(original_mask_shape if original_mask_shape else self.target_size, dtype=np.int64))
             else:
-                # If file doesn't exist (e.g., sample had fewer layers than max_layers_to_load)
-                # Add an empty mask (all background)
-                if original_mask_shape: # Use shape from a previously loaded mask
-                    loaded_layer_masks_np.append(np.zeros(original_mask_shape, dtype=np.int64))
-                elif i == 0: # First mask, try to infer shape from image if possible
-                    img_h, img_w = image.shape[0], image.shape[1] # Assuming image is H,W,C
-                    original_mask_shape = (img_h, img_w)
-                    loaded_layer_masks_np.append(np.zeros(original_mask_shape, dtype=np.int64))
-                else: # Fallback: create a default sized zero mask if original_mask_shape still not set
-                      # This case should ideally not be hit if image is loaded first
-                    logger.warning(f"Layer mask {mask_path} not found and original_mask_shape unknown. Appending default zero mask.")
-                    loaded_layer_masks_np.append(np.zeros(self.target_size, dtype=np.int64))
+                loaded_layer_masks_np.append(np.zeros(original_mask_shape if original_mask_shape else self.target_size, dtype=np.int64))
 
 
         if not original_mask_shape and image is not None: # Fallback if no masks loaded but image did
@@ -192,6 +192,16 @@ class SEMDataset(Dataset):
             [torch.from_numpy(np.array(m_pil, dtype=np.int64)) for m_pil in layer_masks_pil_resized],
             dim=0
         )
+
+        # --- Add Debugging Here ---
+        if idx < 2: # Log for the first few samples
+            logger.debug(f"Sample {idx} - Target Mask Stack Shape: {target_masks_tensor.shape}")
+            background_id_check = SHAPE_TYPE_MAP.get("background", 0) # Get background ID
+            for l_idx_check in range(self.max_layers_to_load):
+                layer_mask_slice = target_masks_tensor[l_idx_check, :, :]
+                num_foreground_pixels = torch.sum(layer_mask_slice != background_id_check).item()
+                unique_vals = torch.unique(layer_mask_slice).cpu().numpy()
+                logger.debug(f"  Layer {l_idx_check} - Sum: {layer_mask_slice.sum().item()}, Num FG Pixels: {num_foreground_pixels}, Unique: {unique_vals}")
 
         return image_tensor, target_masks_tensor
 

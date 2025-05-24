@@ -156,6 +156,8 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
         max_predictable_layers_for_gt = run_settings.get('max_predictable_layers', 5) # Get from config
         sample_logger.info(f"Image Size: {final_h}x{final_w}, Bit Depth: {bit_depth}, Magnification: {magnification:.2f}x")
         sample_logger.info(f"Per-instance Geometric Mode: {geom_mode}")
+        sample_logger.debug(f"Save per-layer semantic masks: {out_opts.get('save_per_layer_shape_type_semantic_masks')}")
+
 
         # --- Initialize Raffler ---
         raff = Raffler(artifact_raffle_settings, sample_rng, sample_logger)
@@ -223,6 +225,8 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
             current_shape_type_id = SHAPE_TYPE_MAP.get(current_layer_shape_type_str, SHAPE_TYPE_MAP["background"]) # Default to background ID
             if current_layer_shape_type_str == 'unknown_shape_type':
                 sample_logger.warning(f"Layer {layer_id_name} has unknown shape type, using background ID for semantic mask.")
+            sample_logger.debug(f"    Layer {layer_id_name} (CfgIdx {layer_config_idx}): shape_str='{current_layer_shape_type_str}', shape_id={current_shape_type_id}")
+
             layer_shape_artifacts_defs = raff.raffle_effects('shape')
             sample_logger.debug(f"    Raffled shape artifacts for layer: {[a.get('name', 'N/A') for a in layer_shape_artifacts_defs]}")
 
@@ -325,7 +329,11 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
 
                     if current_layer_semantic_mask_acc is not None and current_shape_type_id != SHAPE_TYPE_MAP["background"]:
                         # For per-layer semantic mask, accumulate all shapes of this layer
-                        current_layer_semantic_mask_acc[actual_mask_instance > 0] = current_shape_type_id
+                        shape_type_semantic_mask_pre_warp[actual_mask_instance > 0] = current_shape_type_id # This was for the top-most combined one
+                        current_layer_semantic_mask_acc[actual_mask_instance > 0] = current_shape_type_id # This is for the specific layer's semantic mask
+                        sample_logger.debug(f"      Instance {idx}: Updated current_layer_semantic_mask_acc (sum: {np.sum(current_layer_semantic_mask_acc)}) with ID {current_shape_type_id}")
+
+                    sample_logger.debug(f"      Instance {idx}: actual_mask_instance sum: {np.sum(actual_mask_instance)}")
                 # ---
 
 
@@ -402,9 +410,14 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
             # --- Add current layer's semantic mask to the list ---
             if per_layer_shape_type_semantic_masks_pre_warp is not None:
                 if current_layer_semantic_mask_acc is not None:
-                    per_layer_shape_type_semantic_masks_pre_warp.append(current_layer_semantic_mask_acc.copy())
-                else: # Should not happen if main flag is true
+                    # --->>> DEBUG POINT A.1: Check if copy is correct <<<---
+                    mask_to_append = current_layer_semantic_mask_acc.copy()
+                    sample_logger.debug(f"    Mask to append to per_layer_list sum: {mask_to_append.sum()}, dtype: {mask_to_append.dtype}")
+                    per_layer_shape_type_semantic_masks_pre_warp.append(mask_to_append)
+                else:
+                    sample_logger.warning("    current_layer_semantic_mask_acc was None, appending zeros for per-layer list.")
                     per_layer_shape_type_semantic_masks_pre_warp.append(np.zeros(oversized_shape_for_layers, dtype=np.uint8))
+                    
 
             if semantic_map_pre_warp is not None: semantic_map_pre_warp[layer_combined_mask_final_actual > 0] = layer_config_idx + 1
 
@@ -524,6 +537,19 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
                 all_maps_and_masks_for_warping.append(pl_sem_mask)
             num_per_layer_semantic_masks_warped = len(per_layer_shape_type_semantic_masks_pre_warp)
 
+        # --- DEBUG: Check content of per_layer_shape_type_semantic_masks_pre_warp RIGHT BEFORE warping ---
+        if per_layer_shape_type_semantic_masks_pre_warp is not None:
+            sample_logger.debug(f"--- [DEBUG #6.1] Per-Layer Semantic Masks BEFORE any global warp (count: {len(per_layer_shape_type_semantic_masks_pre_warp)}) ---")
+            for i_debug, debug_mask in enumerate(per_layer_shape_type_semantic_masks_pre_warp):
+                if debug_mask is not None:
+                    sample_logger.debug(f"  PLS Mask {i_debug} (pre-warp) sum: {debug_mask.sum()}, shape: {debug_mask.shape}, dtype: {debug_mask.dtype}")
+                else:
+                    sample_logger.debug(f"  PLS Mask {i_debug} (pre-warp) is None")
+        else:
+            sample_logger.warning("per_layer_shape_type_semantic_masks_pre_warp is None before geometric warp stage!")
+            # If this list is None, subsequent steps will fail or produce no per-layer semantic GT
+        # ---
+
 
         # Add individual layer actual masks (these are final post-layer-artifacts, oversized)
         # Ensure a consistent order for adding and later extracting these
@@ -536,28 +562,53 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
                 sample_logger.warning(f"Missing oversized mask for layer index {layer_idx} before warping. Appending None.")
                 all_maps_and_masks_for_warping.append(None) # Maintain list length
 
+        # We will warp the image and this list of per-layer semantic masks together
+        # Other maps (overall semantic, layer order) can be added back later if this works.
+        list_of_masks_to_warp = []
+        if per_layer_shape_type_semantic_masks_pre_warp: # Only add if the list itself exists
+            list_of_masks_to_warp.extend([m.copy() for m in per_layer_shape_type_semantic_masks_pre_warp if m is not None]) # Copy to avoid modifying original
+
         geometric_artifacts = raff.raffle_effects('geometric')
         warp_field_combined_oversized = None # Will store the final warp field for the image
         applied_geometric_artifacts = []
+
+        current_image_being_warped = image_to_warp
+        current_list_of_masks_being_warped = list_of_masks_to_warp # Start with the initial list
+
+        if not geometric_artifacts:
+             sample_logger.info("No geometric artifacts raffled to apply.")
 
         # Sequentially apply each raffled geometric artifact
         for artifact_def in geometric_artifacts:
              func = GEOMETRIC_ARTIFACT_FUNCS.get(artifact_def['name'])
              if func:
                   try:
-                       sample_logger.info(f"Applying geometric artifact: {artifact_def['name']}")
+                       sample_logger.info(f"Applying geometric artifact: {artifact_def['name']} to image and {len(current_list_of_masks_being_warped)} PLS masks.")
                        # The func is expected to take the image and the LIST of masks,
                        # and return the warped image, a LIST of warped masks, and the warp field
                        image_to_warp, all_maps_and_masks_for_warping, current_warp_field_oversized = \
                            func(image_to_warp, all_maps_and_masks_for_warping, artifact_def['params'], sample_rng, sample_logger)
 
                        if current_warp_field_oversized is not None:
-                            warp_field_combined_oversized = current_warp_field_oversized # Store last one
+                            warp_field_combined_oversized = current_warp_field_oversized
                        applied_geometric_artifacts.append(artifact_def['name'])
+
+                       # --- DEBUG: Check content of per-layer semantic masks AFTER THIS warp step ---
+                       if all_maps_and_masks_for_warping:
+                           sample_logger.debug(f"--- [DEBUG #6.2] Per-Layer Semantic Masks AFTER '{artifact_def['name']}' (count: {len(all_maps_and_masks_for_warping)}) ---")
+                           for i_debug, debug_mask in enumerate(all_maps_and_masks_for_warping):
+                               if debug_mask is not None:
+                                   sample_logger.debug(f"  PLS Mask {i_debug} (post-{artifact_def['name']}) sum: {debug_mask.sum()}, shape: {debug_mask.shape}")
+                               else:
+                                   sample_logger.debug(f"  PLS Mask {i_debug} (post-{artifact_def['name']}) is None")
+                       else:
+                            sample_logger.warning(f"List of masks became empty after '{artifact_def['name']}'.")
+                       # ---
                   except Exception as e_geo_art:
                        sample_logger.error(f"Error applying geometric artifact '{artifact_def['name']}': {e_geo_art}", exc_info=True)
              else:
                   sample_logger.warning(f"Geometric artifact function '{artifact_def['name']}' not found.")
+
 
         # --- Center Crop ALL warped items back to FINAL target resolution ---
         sample_logger.info(f"Cropping warped data from {current_w}x{current_h} to {final_w}x{final_h}")
@@ -599,14 +650,31 @@ def generate_sample(sample_idx, sample_seed, base_config, output_parent_dir):
             processed_mask_idx += 1
 
         # Extract per-layer semantic masks
-        warped_per_layer_shape_type_semantic_masks = []
-        if per_layer_shape_type_semantic_masks_pre_warp is not None:
-            for i in range(num_per_layer_semantic_masks_warped):
-                if len(all_maps_and_masks_for_warping) > processed_mask_idx and all_maps_and_masks_for_warping[processed_mask_idx] is not None:
-                    warped_per_layer_shape_type_semantic_masks.append(all_maps_and_masks_for_warping[processed_mask_idx][crop_y_final, crop_x_final])
-                else: # Append an empty mask if something went wrong
-                    warped_per_layer_shape_type_semantic_masks.append(np.zeros((final_h, final_w), dtype=np.uint8))
-                processed_mask_idx += 1
+        warped_per_layer_shape_type_semantic_masks = [] # Stores CROPPED versions
+        # all_maps_and_masks_for_warping now holds the final state of per-layer semantic masks (oversized, warped)
+        if all_maps_and_masks_for_warping:
+            sample_logger.debug(f"--- [DEBUG #6.3] Cropping {len(all_maps_and_masks_for_warping)} Per-Layer Semantic Masks ---")
+            for i_debug, warped_oversized_mask in enumerate(all_maps_and_masks_for_warping):
+                if warped_oversized_mask is not None:
+                    cropped_mask = warped_oversized_mask[crop_y_final, crop_x_final]
+                    warped_per_layer_shape_type_semantic_masks.append(cropped_mask)
+                    sample_logger.debug(f"  Cropped PLS Mask {i_debug} sum: {cropped_mask.sum()}, shape: {cropped_mask.shape}")
+                else:
+                    sample_logger.debug(f"  Oversized warped PLS Mask {i_debug} was None, appending zeros.")
+                    warped_per_layer_shape_type_semantic_masks.append(np.zeros((final_h, final_w), dtype=np.uint8)) # Add empty placeholder
+        else:
+            sample_logger.warning("No per-layer semantic masks available to crop (list was empty after warping).")
+            # Fill with empty masks if padding is still needed up to max_predictable_layers
+            if out_opts.get('save_per_layer_shape_type_semantic_masks'):
+                for _ in range(max_predictable_layers_for_gt):
+                     warped_per_layer_shape_type_semantic_masks.append(np.zeros((final_h, final_w), dtype=np.uint8))
+
+#        if per_layer_shape_type_semantic_masks_pre_warp is not None:
+#            for i in range(num_per_layer_semantic_masks_warped):
+#                if len(all_maps_and_masks_for_warping) > processed_mask_idx and all_maps_and_masks_for_warping[processed_mask_idx] is not None:
+#                else: # Append an empty mask if something went wrong
+#                    warped_per_layer_shape_type_semantic_masks.append(np.zeros((final_h, final_w), dtype=np.uint8))
+#                processed_mask_idx += 1
 
 
         # Extract and crop warped individual layer masks
