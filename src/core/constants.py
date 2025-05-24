@@ -29,7 +29,7 @@ for shape_name in _PREDEFINED_CUSTOM_SHAPES:
 
 # Number of classes for segmentation model (including background)
 NUM_SHAPE_CLASSES = len(SHAPE_TYPE_MAP)
-MAX_PREDICTABLE_LAYERS_FROM_CONFIG = None # Will be set by generator from config
+MAX_PREDICTABLE_LAYERS = 5 # Will be set by generator from config
 
 if __name__ == '__main__':
     # Print for verification

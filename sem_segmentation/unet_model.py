@@ -55,19 +55,20 @@ class Up(nn.Module):
         x = torch.cat([x2, x1], dim=1)
         return self.conv(x)
 
-class OutConv(nn.Module):
-    def __init__(self, in_channels, out_channels):
+class OutConv(nn.Module): # This is the layer that needs to change
+    def __init__(self, in_channels, out_total_channels): # out_total_channels = max_layers * num_shape_classes
         super(OutConv, self).__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        self.conv = nn.Conv2d(in_channels, out_total_channels, kernel_size=1)
 
     def forward(self, x):
         return self.conv(x)
 
 class UNet(nn.Module):
-    def __init__(self, n_channels, n_classes, bilinear=False):
+    # n_classes here should be max_layers * num_shape_classes
+    def __init__(self, n_channels, n_total_output_channels, bilinear=False):
         super(UNet, self).__init__()
         self.n_channels = n_channels
-        self.n_classes = n_classes
+        self.n_total_output_channels = n_total_output_channels # Store this
         self.bilinear = bilinear
 
         self.inc = DoubleConv(n_channels, 64)
@@ -80,7 +81,8 @@ class UNet(nn.Module):
         self.up2 = Up(512, 256 // factor, bilinear)
         self.up3 = Up(256, 128 // factor, bilinear)
         self.up4 = Up(128, 64, bilinear)
-        self.outc = OutConv(64, n_classes)
+        # The final convolution outputs all channels for all layers flattened
+        self.outc = OutConv(64, n_total_output_channels)
 
     def forward(self, x):
         x1 = self.inc(x)
@@ -88,12 +90,12 @@ class UNet(nn.Module):
         x3 = self.down2(x2)
         x4 = self.down3(x3)
         x5 = self.down4(x4)
-        x = self.up1(x5, x4)
-        x = self.up2(x, x3)
-        x = self.up3(x, x2)
-        x = self.up4(x, x1)
-        logits = self.outc(x)
-        return logits
+        x_up = self.up1(x5, x4)
+        x_up = self.up2(x_up, x3)
+        x_up = self.up3(x_up, x2)
+        x_up = self.up4(x_up, x1)
+        logits_flat = self.outc(x_up) # Shape: (B, max_layers * num_shape_classes, H, W)
+        return logits_flat
 
 if __name__ == '__main__':
     # Example usage

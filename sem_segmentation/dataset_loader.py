@@ -1,28 +1,39 @@
 # sem_segmentation/dataset_loader.py
-import os
-import numpy as np
-from PIL import Image, ImageEnhance, ImageFilter 
-import imageio.v3 as iio # Use v3 for consistent API
-from torch.utils.data import Dataset
-import torchvision.transforms.functional as TF
 import torch
+import torchvision.transforms.functional as TF
+from PIL import Image, ImageEnhance, ImageFilter
+import numpy as np
 import random
 from pathlib import Path
+from torch.utils.data import Dataset
+import imageio.v3 as iio
+import logging
+
+logger = logging.getLogger(__name__)
+
+# You'll need MAX_PREDICTABLE_LAYERS here
+# One way: from ..src.core.constants import MAX_PREDICTABLE_LAYERS
+# Or pass it as an argument to the dataset constructor
+# For simplicity, let's assume it's passed as an argument: max_layers_to_load
 
 class SEMDataset(Dataset):
-    def __init__(self, data_dir, target_size=(512, 512), augment=False, use_tif=False, num_classes=None):
+    def __init__(self, data_dir, target_size=(512, 512), augment=False, use_tif=False,
+                 num_classes=None, max_layers_to_load=5): # Added max_layers_to_load
         self.data_dir = Path(data_dir)
-        self.target_size = target_size
+        self.target_size = list(target_size)
         self.augment = augment
-        self.use_tif = use_tif # If true, loads .tif, otherwise .png visual
-        self.num_classes = num_classes
+        self.use_tif = use_tif
+        self.num_classes = num_classes # Total number of shape types + background
+        self.max_layers_to_load = max_layers_to_load # Max layer "slots"
 
         self.sample_dirs = sorted([d for d in self.data_dir.iterdir() if d.is_dir() and d.name.startswith('sem_')])
         if not self.sample_dirs:
-            raise FileNotFoundError(f"No sample directories (sem_XXXXX) found in {data_dir}")
+            raise FileNotFoundError(f"No sample directories found in {data_dir}")
+        logger.info(f"Found {len(self.sample_dirs)} samples in {data_dir}. Max layers to load: {self.max_layers_to_load}")
 
     def __len__(self):
         return len(self.sample_dirs)
+
 
     def __getitem__(self, idx):
         sample_dir = self.sample_dirs[idx]
@@ -75,26 +86,77 @@ class SEMDataset(Dataset):
         # --- Convert to PIL for some augmentations ---
         # Image: from H,W,C (float32 [0,1]) to PIL 'L'
         image_pil = Image.fromarray((image.squeeze() * 255).astype(np.uint8), mode='L')
-        # Mask: from H,W (int64) to PIL 'L' (labels will be preserved as pixel values if <256)
-        # If num_classes > 255, this PIL conversion for mask augmentation is problematic for 'L' mode.
-        # For now, assume num_classes < 256 for PIL-based mask augmentations.
-        mask_pil = Image.fromarray(mask.astype(np.uint8), mode='L') # Mode 'L' for 8-bit labels
+
+        # --- Load Per-Layer Semantic Masks ---
+        # Initialize a tensor to hold all layer masks
+        # Shape: (max_layers_to_load, OriginalH, OriginalW)
+        # We'll resize after loading all and potentially augmenting PIL versions
+        # Load into a list of numpy arrays first
+        loaded_layer_masks_np = []
+        original_mask_shape = None # Store shape from first valid mask
+
+        for i in range(self.max_layers_to_load):
+            # Try to find the layer's specific semantic mask
+            # Path construction depends on how generator saves them (e.g., in the layer_XX subdir)
+            mask_file_name = f"layer_{i:02d}_shape_type_semantic_mask.npy" # Name used in generator proposal
+            mask_path = sample_dir / "layers" / f"layer_{i:02d}" / mask_file_name
+
+            if mask_path.is_file():
+                try:
+                    layer_mask_np = np.load(mask_path).astype(np.int64) # H, W
+                    loaded_layer_masks_np.append(layer_mask_np)
+                    if original_mask_shape is None:
+                        original_mask_shape = layer_mask_np.shape
+                except Exception as e:
+                    logger.warning(f"Error loading layer mask {mask_path} for sample {sample_dir.name}: {e}. Using empty mask.")
+                    # If a mask file for a layer slot is missing or corrupt, add an empty mask
+                    if original_mask_shape: # Use shape from a previously loaded mask
+                         loaded_layer_masks_np.append(np.zeros(original_mask_shape, dtype=np.int64))
+                    # else: # No masks loaded yet to get shape, this is an issue. How to get H,W?
+                    # For now, assume at least one mask will load to set original_mask_shape.
+                    # A better way is to get H,W from the input image.
+            else:
+                # If file doesn't exist (e.g., sample had fewer layers than max_layers_to_load)
+                # Add an empty mask (all background)
+                if original_mask_shape: # Use shape from a previously loaded mask
+                    loaded_layer_masks_np.append(np.zeros(original_mask_shape, dtype=np.int64))
+                elif i == 0: # First mask, try to infer shape from image if possible
+                    img_h, img_w = image.shape[0], image.shape[1] # Assuming image is H,W,C
+                    original_mask_shape = (img_h, img_w)
+                    loaded_layer_masks_np.append(np.zeros(original_mask_shape, dtype=np.int64))
+                else: # Fallback: create a default sized zero mask if original_mask_shape still not set
+                      # This case should ideally not be hit if image is loaded first
+                    logger.warning(f"Layer mask {mask_path} not found and original_mask_shape unknown. Appending default zero mask.")
+                    loaded_layer_masks_np.append(np.zeros(self.target_size, dtype=np.int64))
+
+
+        if not original_mask_shape and image is not None: # Fallback if no masks loaded but image did
+            original_mask_shape = (image.shape[0], image.shape[1])
+
+        # Ensure all placeholder masks have the correct original_mask_shape if it was determined late
+        for i in range(len(loaded_layer_masks_np)):
+            if loaded_layer_masks_np[i].shape != original_mask_shape and original_mask_shape is not None:
+                logger.warning(f"Correcting shape of placeholder mask for layer {i}")
+                loaded_layer_masks_np[i] = np.zeros(original_mask_shape, dtype=np.int64)
+
+
+        # Convert list of numpy masks to list of PIL masks for augmentation
+        layer_masks_pil = [Image.fromarray(m.astype(np.uint8), mode='L') for m in loaded_layer_masks_np]
 
         # --- Augmentation (applied to PIL Images) ---
         if self.augment:
-            # Random horizontal flip
-            if random.random() > 0.5:
+            # Apply the *same* geometric augmentation to the image and *all* layer masks
+            if random.random() > 0.5: # Horizontal Flip
                 image_pil = TF.hflip(image_pil)
-                mask_pil = TF.hflip(mask_pil)
-            # Random vertical flip
-            if random.random() > 0.5:
+                layer_masks_pil = [TF.hflip(m) for m in layer_masks_pil]
+            if random.random() > 0.5: # Vertical Flip
                 image_pil = TF.vflip(image_pil)
-                mask_pil = TF.vflip(mask_pil)
-            # Random rotation (0, 90, 180, 270 degrees)
-            angle = random.choice([0, 90, 180, 270])
+                layer_masks_pil = [TF.vflip(m) for m in layer_masks_pil]
+
+            angle = random.choice([0, 0, 0, 90, 180, 270]) # More chance for 0 rotation
             if angle != 0:
                 image_pil = TF.rotate(image_pil, angle, interpolation=TF.InterpolationMode.BILINEAR)
-                mask_pil = TF.rotate(mask_pil, angle, interpolation=TF.InterpolationMode.NEAREST)
+                layer_masks_pil = [TF.rotate(m, angle, interpolation=TF.InterpolationMode.NEAREST) for m in layer_masks_pil]
 
             # Color Jitter (Brightness, Contrast) - for image only
             if random.random() > 0.3: # Apply with 30% chance
@@ -109,31 +171,29 @@ class SEMDataset(Dataset):
                 blur_radius = random.uniform(0.1, 1.5)
                 image_pil = image_pil.filter(ImageFilter.GaussianBlur(radius=blur_radius))
 
-            # Small Affine Transformation (Careful with masks - NEAREST needed)
+            # Small Affine (apply to image and all masks)
             if random.random() > 0.2:
-                affine_angle = random.uniform(-10, 10) # degrees
-                max_translate = 0.1 * self.target_size[0] # 10% of width/height
-                translate_x = random.uniform(-max_translate, max_translate)
-                translate_y = random.uniform(-max_translate, max_translate)
-                scale = random.uniform(0.9, 1.1)
-                shear = random.uniform(-5, 5) # degrees
+                affine_angle = random.uniform(-7, 7); max_translate = 0.07 * self.target_size[0]
+                translate_x = random.uniform(-max_translate, max_translate); translate_y = random.uniform(-max_translate, max_translate)
+                scale = random.uniform(0.93, 1.07); shear = random.uniform(-3, 3)
+                image_pil = TF.affine(image_pil, angle=affine_angle, translate=(translate_x, translate_y), scale=scale, shear=shear, interpolation=TF.InterpolationMode.BILINEAR, fill=0)
+                layer_masks_pil = [TF.affine(m, angle=affine_angle, translate=(translate_x, translate_y), scale=scale, shear=shear, interpolation=TF.InterpolationMode.NEAREST, fill=0) for m in layer_masks_pil]
 
-                image_pil = TF.affine(image_pil, angle=affine_angle, translate=(translate_x, translate_y),
-                                      scale=scale, shear=shear, interpolation=TF.InterpolationMode.BILINEAR, fill=0) # Fill with black
-                mask_pil = TF.affine(mask_pil, angle=affine_angle, translate=(translate_x, translate_y),
-                                     scale=scale, shear=shear, interpolation=TF.InterpolationMode.NEAREST, fill=0) # Fill with background ID
 
         # --- Resize (after augmentations) ---
         image_pil_resized = TF.resize(image_pil, self.target_size, interpolation=TF.InterpolationMode.BILINEAR)
-        mask_pil_resized = TF.resize(mask_pil, self.target_size, interpolation=TF.InterpolationMode.NEAREST)
+        layer_masks_pil_resized = [TF.resize(m, self.target_size, interpolation=TF.InterpolationMode.NEAREST) for m in layer_masks_pil]
 
         # --- Convert back to Tensor ---
-        # Image: PIL 'L' to Tensor (C,H,W) float [0,1]
-        image_tensor = TF.to_tensor(image_pil_resized)
-        # Mask: PIL 'L' (with class labels) to Tensor (H,W) long
-        mask_tensor = torch.from_numpy(np.array(mask_pil_resized, dtype=np.int64))
+        image_tensor = TF.to_tensor(image_pil_resized) # C,H,W
 
-        return image_tensor, mask_tensor
+        # Stack layer masks into a single tensor: (max_layers, H, W) torch.long
+        target_masks_tensor = torch.stack(
+            [torch.from_numpy(np.array(m_pil, dtype=np.int64)) for m_pil in layer_masks_pil_resized],
+            dim=0
+        )
+
+        return image_tensor, target_masks_tensor
 
 if __name__ == '__main__':
     # Example Usage:

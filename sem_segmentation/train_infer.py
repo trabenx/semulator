@@ -26,7 +26,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 try:
-    from constants import SHAPE_TYPE_MAP, NUM_SHAPE_CLASSES
+    from constants import SHAPE_TYPE_MAP, NUM_SHAPE_CLASSES, MAX_PREDICTABLE_LAYERS
 except ImportError:
     logger.error("Could not import SHAPE_TYPE_MAP, NUM_SHAPE_CLASSES from constants. Ensure it's in src/core and path is correct.")
     # Define fallbacks if import fails, but this is not ideal
@@ -48,6 +48,47 @@ class DiceLoss(nn.Module):
         intersection = (pred_flat * target_flat).sum()
         dice_score = (2. * intersection + self.smooth) / (pred_flat.sum() + target_flat.sum() + self.smooth)
         return 1 - dice_score # We want to minimize 1 - DiceScore
+
+
+# --- Multi-class Dice for "X-Ray" output ---
+def dice_coefficient_xray(model_outputs_flat, target_masks_stacked, num_shape_classes, max_layers, smooth=1e-6):
+    # model_outputs_flat: (B, max_layers * num_shape_classes, H, W)
+    # target_masks_stacked: (B, max_layers, H, W) - with class indices
+    if num_shape_classes <= 1 or max_layers == 0: return torch.tensor(0.0)
+
+    B, _, H, W = model_outputs_flat.shape
+    
+    # Reshape model output: (B, max_layers, num_shape_classes, H, W)
+    model_outputs_reshaped = model_outputs_flat.view(B, max_layers, num_shape_classes, H, W)
+    
+    total_dice = 0.0
+    active_layers_count_for_dice = 0
+
+    for l in range(max_layers):
+        layer_logits = model_outputs_reshaped[:, l, :, :, :] # B, num_shape_classes, H, W
+        layer_targets = target_masks_stacked[:, l, :, :]   # B, H, W
+
+        # Only calculate Dice for layers that have actual content (not all background)
+        if torch.any(layer_targets != SHAPE_TYPE_MAP.get("background", 0)):
+            layer_pred_probs = torch.softmax(layer_logits, dim=1)
+            layer_pred_labels = torch.argmax(layer_pred_probs, dim=1) # B, H, W
+
+            dice_per_class_this_layer = []
+            for c in range(num_shape_classes):
+                if c == SHAPE_TYPE_MAP.get("background", 0): continue # Skip background
+
+                pred_c = (layer_pred_labels == c).float().view(B, -1)
+                target_c = (layer_targets == c).float().view(B, -1)
+
+                intersection = (pred_c * target_c).sum(dim=1)
+                score = (2. * intersection + smooth) / (pred_c.sum(dim=1) + target_c.sum(dim=1) + smooth)
+                dice_per_class_this_layer.append(score.mean()) # Mean dice for this class across batch
+
+            if dice_per_class_this_layer:
+                total_dice += torch.mean(torch.stack(dice_per_class_this_layer))
+                active_layers_count_for_dice += 1
+    
+    return total_dice / active_layers_count_for_dice if active_layers_count_for_dice > 0 else torch.tensor(0.0)
 
 
 # --- Multi-class Dice Coefficient (Example: Macro Average) ---
@@ -86,8 +127,8 @@ def dice_coefficient(pred, target, smooth=1e-6):
     return (2. * intersection + smooth) / (pred_flat.sum() + target_flat.sum() + smooth)
 
 
-def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, device, epochs, checkpoint_dir, num_classes):
-    logger.info(f"Starting training for {epochs} epochs on {device} for {num_classes} classes...")
+def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, device, epochs, checkpoint_dir, num_shape_classes, max_layers): # Added scheduler
+    logger.info(f"Starting training for {epochs} epochs on {device} for {num_shape_classes} classes across {max_layers} layers...")
     best_val_dice = 0.0
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
@@ -97,22 +138,39 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         epoch_dice = 0.0
         
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]", unit="batch")
-        for images, masks in progress_bar:
+        for images, target_masks_stacked in progress_bar: # Renamed 'masks' to 'target_masks_stacked'
             images = images.to(device)
-            masks = masks.to(device)
+            target_masks_stacked = target_masks_stacked.to(device) # (B, max_layers, H, W)
 
             optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, masks)
-            # dice = dice_coefficient(outputs, masks)
-            dice = dice_coefficient_multiclass(outputs, masks, num_classes)
+            outputs_flat = model(images) # (B, max_layers * num_shape_classes, H, W)
 
-            loss.backward()
+            # --- Calculate Loss and Dice PER LAYER ---
+            B, _, H_out, W_out = outputs_flat.shape
+            # Ensure NUM_SHAPE_CLASSES is not zero to avoid division error if constants not loaded
+            current_num_shape_classes = num_shape_classes if num_shape_classes > 0 else 1
+            outputs_reshaped = outputs_flat.view(B, max_layers, current_num_shape_classes, H_out, W_out)
+            
+            batch_total_loss = 0.0
+            for l_idx in range(max_layers):
+                layer_output_logits = outputs_reshaped[:, l_idx, :, :, :] # B, NUM_SHAPE_CLASSES, H, W
+                layer_target_mask = target_masks_stacked[:, l_idx, :, :]    # B, H, W (long)
+                batch_total_loss += criterion(layer_output_logits, layer_target_mask)
+            
+            # Average loss over layers for this batch
+            current_batch_loss = batch_total_loss / max_layers if max_layers > 0 else batch_total_loss
+            # --- End Per-Layer Loss ---
+
+            # Dice coefficient is calculated on the full flat output and stacked targets
+            # (dice_coefficient_xray should handle reshaping internally)
+            current_batch_dice = dice_coefficient_xray(outputs_flat, target_masks_stacked, num_shape_classes, max_layers)
+
+            current_batch_loss.backward() # Backpropagate the averaged loss
             optimizer.step()
 
-            epoch_loss += loss.item()
-            epoch_dice += dice.item()
-            progress_bar.set_postfix(loss=loss.item(), dice=dice.item())
+            epoch_loss += current_batch_loss.item()
+            epoch_dice += current_batch_dice.item() # .item() if dice is a tensor
+            progress_bar.set_postfix(loss=current_batch_loss.item(), dice=current_batch_dice.item())
 
         avg_epoch_loss = epoch_loss / len(train_loader)
         avg_epoch_dice = epoch_dice / len(train_loader)
@@ -124,22 +182,33 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         val_dice = 0.0
         with torch.no_grad():
             progress_bar_val = tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} [Val]", unit="batch")
-            for images, masks in progress_bar_val:
+            for images, target_masks_stacked in progress_bar_val: # Renamed
                 images = images.to(device)
-                masks = masks.to(device)
-                outputs = model(images)
-                loss = criterion(outputs, masks)
-                # dice = dice_coefficient(outputs, masks)
-                dice = dice_coefficient_multiclass(outputs, masks, num_classes)
-                val_loss += loss.item()
-                val_dice += dice.item()
-                progress_bar_val.set_postfix(loss=loss.item(), dice=dice.item())
+                target_masks_stacked = target_masks_stacked.to(device)
+                outputs_flat = model(images)
 
+                # --- Calculate Loss PER LAYER for Validation ---
+                B_val, _, H_val, W_val = outputs_flat.shape
+                outputs_reshaped_val = outputs_flat.view(B_val, max_layers, current_num_shape_classes, H_val, W_val)
+                batch_total_loss_val = 0.0
+                for l_idx in range(max_layers):
+                    layer_output_logits_val = outputs_reshaped_val[:, l_idx, :, :, :]
+                    layer_target_mask_val = target_masks_stacked[:, l_idx, :, :]
+                    batch_total_loss_val += criterion(layer_output_logits_val, layer_target_mask_val)
+                current_batch_loss_val = batch_total_loss_val / max_layers if max_layers > 0 else batch_total_loss_val
+                # ---
+
+                current_batch_dice_val = dice_coefficient_xray(outputs_flat, target_masks_stacked, num_shape_classes, max_layers)
+                
+                val_loss += current_batch_loss_val.item()
+                val_dice += current_batch_dice_val.item() # .item() if dice is a tensor
+                progress_bar_val.set_postfix(loss=current_batch_loss_val.item(), dice=current_batch_dice_val.item())
 
         avg_val_loss = val_loss / len(val_loader)
         avg_val_dice = val_dice / len(val_loader)
-        scheduler.step(avg_val_dice)
         logger.info(f"Epoch {epoch+1} - Val Loss: {avg_val_loss:.4f}, Val Dice: {avg_val_dice:.4f}")
+
+        scheduler.step(avg_val_dice) # Step the scheduler based on validation Dice
 
         if avg_val_dice > best_val_dice:
             best_val_dice = avg_val_dice
@@ -156,7 +225,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
     logger.info("Training finished.")
 
 
-def infer_single_image(model, image_path, device, target_size=(512, 512), use_tif=False, num_classes=None):
+def infer_single_image(model, image_path, device, target_size=(512, 512), use_tif=False, num_shape_classes=None):
     model.eval()
     
     # Load and preprocess image (similar to dataset loader)
@@ -187,29 +256,28 @@ def infer_single_image(model, image_path, device, target_size=(512, 512), use_ti
     image_tensor_resized = image_tensor_resized.unsqueeze(0).to(device) # Add batch dimension
 
     with torch.no_grad():
-        output_logits = model(image_tensor_resized)
-        if num_classes == 1: # Binary case
-            output_probs = torch.sigmoid(output_logits)
-            predicted_labels_resized = (output_probs > 0.5).squeeze(0).cpu() # C, H, W -> H,W if C=1
-        else: # Multi-class
-            predicted_labels_resized = torch.argmax(output_logits, dim=1).squeeze(0).cpu() # B,H,W -> H,W (long)
+        output_logits_flat = model(image_tensor_resized) # (1, max_layers * num_shape_classes, H_resized, W_resized)
 
-    # Resize mask back to original image dimensions
-    # Ensure predicted_labels_resized is (1,H,W) or (H,W) for resize
-    if predicted_labels_resized.ndim == 2:
-         predicted_labels_resized_for_tf = predicted_labels_resized.unsqueeze(0) # Add C dim for TF.resize
-    else: # Should be (C,H,W) where C=1 for binary, or already H,W for argmax
-         predicted_labels_resized_for_tf = predicted_labels_resized
+    B, _, H_r, W_r = output_logits_flat.shape
+    output_logits_reshaped = output_logits_flat.view(B, max_layers, num_shape_classes, H_r, W_r)
 
-    predicted_mask_original_size = TF.resize(
-        predicted_labels_resized_for_tf.float(), # TF.resize needs float input
-        [original_h, original_w],
-        interpolation=TF.InterpolationMode.NEAREST
-    )
+    predicted_layer_masks_np = []
+    for l_idx in range(max_layers):
+        layer_logits = output_logits_reshaped[:, l_idx, :, :, :]
+        # Get predicted class labels for this layer
+        predicted_labels_resized_layer = torch.argmax(layer_logits, dim=1).squeeze(0).cpu() # H_resized, W_resized (long)
+
+        # Resize mask back to original image dimensions
+        pred_labels_resized_layer_for_tf = predicted_labels_resized_layer.unsqueeze(0).float() # Needs C dim, float
+        layer_mask_original_size = TF.resize(
+            pred_labels_resized_layer_for_tf,
+            [original_h, original_w],
+            interpolation=TF.InterpolationMode.NEAREST
+        )
+        predicted_layer_masks_np.append(layer_mask_original_size.squeeze(0).numpy().astype(np.uint8))
     
-    predicted_mask_np = predicted_mask_original_size.squeeze(0).numpy().astype(np.uint8)
-    return predicted_mask_np
-
+    # Returns a list of numpy arrays, each (OriginalH, OriginalW) with class IDs for that layer
+    return predicted_layer_masks_np
 
 def check_cuda_availability_details(chosen_device_str=None):
     """Prints details about CUDA availability and potential issues."""
@@ -296,7 +364,7 @@ def check_cuda_availability_details(chosen_device_str=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train and run inference for SEM shape segmentation.")
+    parser = argparse.ArgumentParser(description="Train/Infer for SEM X-Ray Segmentation.")
     parser.add_argument('--mode', type=str, required=True, choices=['train', 'infer'], help="Mode: 'train' or 'infer'")
     parser.add_argument('--data_dir', type=str, default='./generated_dataset', help="Path to the generated SEM dataset")
     parser.add_argument('--use_tif', action='store_true', help="Load .tif images instead of .png visuals for input")
@@ -310,6 +378,7 @@ def main():
     parser.add_argument('--input_image', type=str, help="Path to a single image for inference")
     parser.add_argument('--output_dir', type=str, default='./results', help="Directory to save inference results")
     parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cuda', 'cpu'], help="Device to use: 'auto' (try CUDA, fallback to CPU), 'cuda' (force CUDA), 'cpu' (force CPU).")
+    parser.add_argument('--max_layers', type=int, default=MAX_PREDICTABLE_LAYERS, help="Max layers model predicts for X-Ray vision.")
 
     args = parser.parse_args()
 
@@ -357,7 +426,8 @@ def main():
     if args.mode == 'train':
         Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
         dataset = SEMDataset(data_dir=args.data_dir, target_size=target_size_tuple,
-                             augment=True, use_tif=args.use_tif, num_classes=NUM_SHAPE_CLASSES)
+                             augment=True, use_tif=args.use_tif,
+                             num_classes=NUM_SHAPE_CLASSES, max_layers_to_load=args.max_layers) # Pass max_layers
         
         val_size = int(len(dataset) * args.val_split)
         train_size = len(dataset) - val_size
@@ -366,12 +436,11 @@ def main():
         train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=(device.type == 'cuda'))
         val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=(device.type == 'cuda'))
 
-        model = UNet(n_channels=1, n_classes=NUM_SHAPE_CLASSES).to(device)
-        
-        criterion = nn.CrossEntropyLoss() # For multi-class semantic segmentation
+        model = UNet(n_channels=1, n_total_output_channels=args.max_layers * NUM_SHAPE_CLASSES).to(device) # Correct output channels
+        criterion = nn.CrossEntropyLoss() # Ignores background by default if target has it and not in output channel for background
         optimizer = optim.Adam(model.parameters(), lr=args.lr)
-        scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=5, verbose=True) # Reduce LR if val_dice doesn't improve for 5 epochs
-        train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, device, args.epochs, Path(args.checkpoint_dir), NUM_SHAPE_CLASSES)
+        scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=5) # Reduce LR if val_dice doesn't improve for 5 epochs
+        train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, device, args.epochs, Path(args.checkpoint_dir), NUM_SHAPE_CLASSES, args.max_layers)
 
     elif args.mode == 'infer':
         if not args.model_path or not args.input_image:
@@ -380,7 +449,7 @@ def main():
 
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
         
-        model = UNet(n_channels=1, n_classes=NUM_SHAPE_CLASSES).to(device)
+        model = UNet(n_channels=1, n_total_output_channels=args.max_layers * NUM_SHAPE_CLASSES).to(device)
         try:
             model.load_state_dict(torch.load(args.model_path, map_location=device))
             logger.info(f"Loaded model from {args.model_path}")
@@ -388,97 +457,110 @@ def main():
             logger.error(f"Error loading model: {e}")
             return
 
-        predicted_mask_np = infer_single_image(model, args.input_image, device, target_size_tuple, args.use_tif, num_classes=NUM_SHAPE_CLASSES)
+        list_of_predicted_layer_masks_np = infer_single_image(
+            model, args.input_image, device, target_size_tuple, args.use_tif,
+            num_classes=NUM_SHAPE_CLASSES, max_layers=args.max_layers
+        )
 
-        if predicted_mask_np is not None:
+        if list_of_predicted_layer_masks_np:
             input_filename = Path(args.input_image).stem
-            output_mask_path_npy = Path(args.output_dir) / f"{input_filename}_predicted_semantic_mask.npy"
-            np.save(output_mask_path_npy, predicted_mask_np) # Save raw class IDs
-            logger.info(f"Saved predicted semantic mask (npy) to {output_mask_path_npy}")
+            output_dir_path = Path(args.output_dir)
+            output_dir_path.mkdir(parents=True, exist_ok=True)
 
-            # --- Create Colored Visualization of Semantic Prediction ---
-            pred_colormap = {} # Initialize
+            from src.core.utils import create_color_visualization, get_distinct_colors # For vis
+
+            # --- Save individual predicted layer masks and their visualizations ---
+            layer_vis_colors = get_distinct_colors(NUM_SHAPE_CLASSES) # Colors for shape types
+            shape_type_colormap = {i: layer_vis_colors[i % len(layer_vis_colors)] for i in range(NUM_SHAPE_CLASSES)}
+
+            for l_idx, pred_mask_np in enumerate(list_of_predicted_layer_masks_np):
+                out_path_npy = output_dir_path / f"{input_filename}_pred_layer_{l_idx:02d}_semantic.npy"
+                np.save(out_path_npy, pred_mask_np)
+                logger.info(f"Saved predicted semantic mask for layer {l_idx} to {out_path_npy}")
+
+                if np.any(pred_mask_np > 0): # Only visualize if there's content
+                    pred_mask_vis_img = create_color_visualization(pred_mask_np, shape_type_colormap)
+                    out_path_vis = output_dir_path / f"{input_filename}_pred_layer_{l_idx:02d}_semantic_vis.png"
+                    iio.imwrite(out_path_vis, pred_mask_vis_img)
+
+            # --- Load Original Image for Overlay ---
+            original_image_for_overlay_np = None
             try:
-       
-                from utils import create_color_visualization, get_distinct_colors
-                # Use the SHAPE_TYPE_MAP for consistent coloring if possible, or just distinct colors
-                num_colors_to_gen = max(np.max(predicted_mask_np) + 1 if predicted_mask_np.size > 0 else 0, NUM_SHAPE_CLASSES) # Handle empty mask
-                if num_colors_to_gen > 0: # Only generate if there are classes
-                    pred_vis_colors = get_distinct_colors(num_colors_to_gen)
-                    pred_colormap = {i: pred_vis_colors[i % len(pred_vis_colors)] for i in range(num_colors_to_gen)}
-                    predicted_mask_vis_img = create_color_visualization(predicted_mask_np, pred_colormap)
-
-                    output_mask_vis_path = Path(args.output_dir) / f"{input_filename}_predicted_semantic_mask_vis.png"
-                    iio.imwrite(output_mask_vis_path, predicted_mask_vis_img)
-                    logger.info(f"Saved predicted semantic mask visualization to {output_mask_vis_path}")
-                else:
-                    logger.warning("Predicted mask is empty or has no classes; skipping visualization.")
-            except Exception as e_vis:
-                 logger.warning(f"Could not create semantic mask visualization: {e_vis}")
-
-            # --- Create Overlay on Original Image ---
-            try:
-                # Load original image
                 if args.use_tif:
                     original_image_np_load = iio.imread(args.input_image)
-                    # --- *** START IMPLEMENT TIF to 8-bit RGB conversion *** ---
-                    if original_image_np_load.ndim == 2: # Grayscale
-                        original_image_np_load = np.stack([original_image_np_load]*3, axis=-1)
-                    elif original_image_np_load.shape[-1] == 1: # Grayscale with channel dim
-                        original_image_np_load = np.repeat(original_image_np_load, 3, axis=-1)
-                    elif original_image_np_load.shape[-1] == 4: # RGBA
-                        original_image_np_load = original_image_np_load[:,:,:3] # Take RGB
-
-                    # Normalize to 0-255 uint8
-                    if original_image_np_load.dtype == np.uint16:
-                        original_image_np_load = (original_image_np_load / 256).astype(np.uint8)
+                    if original_image_np_load.ndim == 2: original_image_np_load = np.stack([original_image_np_load]*3, axis=-1)
+                    elif original_image_np_load.shape[-1] == 1: original_image_np_load = np.repeat(original_image_np_load, 3, axis=-1)
+                    elif original_image_np_load.shape[-1] == 4: original_image_np_load = original_image_np_load[:,:,:3]
+                    if original_image_np_load.dtype == np.uint16: original_image_np_load = (original_image_np_load / 256).astype(np.uint8)
                     elif original_image_np_load.dtype != np.uint8:
-                        # Attempt general normalization if not uint16 or uint8
                         min_val, max_val = np.min(original_image_np_load), np.max(original_image_np_load)
-                        if max_val > min_val:
-                             original_image_np_load = ((original_image_np_load - min_val) / (max_val - min_val) * 255).astype(np.uint8)
-                        else: # Flat image
-                             original_image_np_load = np.full_like(original_image_np_load, 128, dtype=np.uint8) # Mid-gray
-                    # --- *** END IMPLEMENT TIF to 8-bit RGB conversion *** ---
-                else: # PNG
+                        if max_val > min_val: original_image_np_load = ((original_image_np_load - min_val) / (max_val - min_val) * 255).astype(np.uint8)
+                        else: original_image_np_load = np.full_like(original_image_np_load, 128, dtype=np.uint8)
+                else:
                     original_image_pil_load = Image.open(args.input_image).convert("RGB")
-                    original_image_np_load = np.array(original_image_pil_load) # Already H,W,3 uint8
-
-                # Ensure predicted mask is H,W
-                current_predicted_mask_np = predicted_mask_np
-                if current_predicted_mask_np.ndim == 3 and current_predicted_mask_np.shape[0] == 1: # (1,H,W)
-                    current_predicted_mask_np = current_predicted_mask_np.squeeze(0)
-                elif current_predicted_mask_np.ndim != 2:
-                     raise ValueError(f"Predicted mask has unexpected dimensions: {current_predicted_mask_np.shape}")
-
-
-                overlay_image = original_image_np_load.copy()
+                    original_image_np_load = np.array(original_image_pil_load)
                 
-                # Resize original image to match predicted mask's dimensions if they differ
-                # This assumes predicted_mask_np is already at the *original image size* from infer_single_image
-                if original_image_np_load.shape[:2] != current_predicted_mask_np.shape[:2]:
+                # Ensure original image matches the (potentially resized) output mask dimensions
+                # list_of_predicted_layer_masks_np[0] gives the shape of predicted masks (H,W)
+                if original_image_np_load.shape[:2] != list_of_predicted_layer_masks_np[0].shape[:2]:
                     from skimage.transform import resize as sk_resize
-                    logger.warning(f"Original image shape {original_image_np_load.shape[:2]} differs from predicted mask {current_predicted_mask_np.shape[:2]}. Resizing original for overlay.")
-                    original_image_np_load = sk_resize(original_image_np_load, current_predicted_mask_np.shape[:2], preserve_range=True, anti_aliasing=True).astype(np.uint8)
-                    overlay_image = original_image_np_load.copy()
+                    logger.warning(f"Original image shape {original_image_np_load.shape[:2]} differs from predicted mask shape {list_of_predicted_layer_masks_np[0].shape[:2]}. Resizing original for overlay.")
+                    original_image_for_overlay_np = sk_resize(original_image_np_load, list_of_predicted_layer_masks_np[0].shape[:2], preserve_range=True, anti_aliasing=True).astype(np.uint8)
+                else:
+                    original_image_for_overlay_np = original_image_np_load.copy()
 
-                alpha_blend = 0.4
-                # Use the pred_colormap defined earlier (it will be empty if vis failed, but loop won't run if NUM_SHAPE_CLASSES is small)
-                for class_id in range(1, NUM_SHAPE_CLASSES): # Iterate foreground classes
-                    class_mask_bool = (current_predicted_mask_np == class_id)
-                    if np.any(class_mask_bool):
-                        # Ensure pred_colormap exists and has the key
-                        color_for_class = pred_colormap.get(class_id, (0,255,0) if class_id % 2 == 0 else (255,0,0)) # Default alternating colors
-                        overlay_image[class_mask_bool] = (
-                            (1 - alpha_blend) * overlay_image[class_mask_bool] +
-                            alpha_blend * np.array(color_for_class, dtype=np.uint8)
+            except Exception as e_load_orig:
+                logger.warning(f"Could not load original image for overlay: {e_load_orig}")
+                original_image_for_overlay_np = None
+
+
+            # --- 1. Composite Overlay (Top-most with transparency) ---
+            if original_image_for_overlay_np is not None:
+                composite_overlay_image = original_image_for_overlay_np.copy()
+                # Define a set of distinct colors for layers (not shape types within layer)
+                layer_overlay_colors = get_distinct_colors(args.max_layers)
+                alpha_blend = 0.5 # Transparency for overlay
+
+                # Iterate from bottom layer to top layer for correct "drawing" order
+                for l_idx in range(args.max_layers):
+                    pred_mask_np_layer = list_of_predicted_layer_masks_np[l_idx]
+                    layer_color = layer_overlay_colors[l_idx % len(layer_overlay_colors)]
+
+                    # Find all foreground pixels for this layer (any shape type > background)
+                    foreground_pixels_this_layer = (pred_mask_np_layer != SHAPE_TYPE_MAP.get("background", 0))
+                    
+                    if np.any(foreground_pixels_this_layer):
+                        composite_overlay_image[foreground_pixels_this_layer] = (
+                            (1 - alpha_blend) * composite_overlay_image[foreground_pixels_this_layer] +
+                            alpha_blend * np.array(layer_color, dtype=np.uint8)
                         ).astype(np.uint8)
+                
+                output_composite_overlay_path = output_dir_path / f"{input_filename}_composite_overlay.png"
+                iio.imwrite(output_composite_overlay_path, composite_overlay_image)
+                logger.info(f"Saved composite overlay image to {output_composite_overlay_path}")
 
-                output_overlay_path = Path(args.output_dir) / f"{input_filename}_semantic_overlay.png"
-                iio.imwrite(output_overlay_path, overlay_image)
-                logger.info(f"Saved semantic overlay image to {output_overlay_path}")
-            except Exception as e_overlay:
-                logger.warning(f"Could not create semantic overlay image: {e_overlay}", exc_info=True)
+
+            # --- 2. Combined Layer-Colored Semantic Mask Visualization ---
+            # Create a single mask where pixel color is determined by the topmost *active* layer's color
+            # (using the same layer_overlay_colors)
+            if list_of_predicted_layer_masks_np:
+                h_pred, w_pred = list_of_predicted_layer_masks_np[0].shape
+                combined_vis_mask_colored = np.zeros((h_pred, w_pred, 3), dtype=np.uint8) # Black background
+                
+                # Iterate from bottom layer to top layer, so top layer overwrites
+                for l_idx in range(args.max_layers):
+                    pred_mask_np_layer = list_of_predicted_layer_masks_np[l_idx]
+                    layer_color = layer_overlay_colors[l_idx % len(layer_overlay_colors)]
+                    
+                    # Pixels that belong to any foreground shape type in this layer
+                    foreground_pixels_this_layer = (pred_mask_np_layer != SHAPE_TYPE_MAP.get("background", 0))
+                    
+                    if np.any(foreground_pixels_this_layer):
+                        combined_vis_mask_colored[foreground_pixels_this_layer] = layer_color
+                
+                output_combined_vis_path = output_dir_path / f"{input_filename}_combined_layers_vis.png"
+                iio.imwrite(output_combined_vis_path, combined_vis_mask_colored)
+                logger.info(f"Saved combined layer visualization to {output_combined_vis_path}")
 
 
 if __name__ == '__main__':
