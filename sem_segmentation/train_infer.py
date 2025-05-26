@@ -498,6 +498,12 @@ def main():
         val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=(device.type == 'cuda'))
 
         model = UNet(n_channels=1, n_total_output_channels=args.max_layers * NUM_SHAPE_CLASSES).to(device) # Correct output channels
+        if args.model_path and Path(args.model_path).is_file():  # Check if resuming/fine-tuning
+            try:
+                logger.info(f"Floading model weights from: {args.model_path} for continued training.")
+                model.load_state_dict(torch.load(args.model_path, map_location=device))
+            except Exception as e:
+                logger.error(f"Could no  load weights from {args.model_path}: {e}. Starting from scratch")
         criterion = nn.CrossEntropyLoss() # Ignores background by default if target has it and not in output channel for background
         optimizer = optim.Adam(model.parameters(), lr=args.lr)
         scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.2, patience=3, threshold=0.001, threshold_mode='abs', min_lr=1e-8) # Reduce LR if val_dice doesn't improve for 5 epochs
