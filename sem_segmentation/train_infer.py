@@ -286,7 +286,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
     logger.info("Training finished.")
 
 
-def infer_single_image(model, image_path, device, target_size=(512, 512), use_tif=False, num_shape_classes=None):
+def infer_single_image(model, image_path, device, target_size=(512, 512), use_tif=False, num_shape_classes=None, max_layers=5):
     model.eval()
     
     # Load and preprocess image (similar to dataset loader)
@@ -500,7 +500,7 @@ def main():
         model = UNet(n_channels=1, n_total_output_channels=args.max_layers * NUM_SHAPE_CLASSES).to(device) # Correct output channels
         criterion = nn.CrossEntropyLoss() # Ignores background by default if target has it and not in output channel for background
         optimizer = optim.Adam(model.parameters(), lr=args.lr)
-        scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=5) # Reduce LR if val_dice doesn't improve for 5 epochs
+        scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.2, patience=3, threshold=0.001, threshold_mode='abs', min_lr=1e-8) # Reduce LR if val_dice doesn't improve for 5 epochs
         train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, device, args.epochs, Path(args.checkpoint_dir), NUM_SHAPE_CLASSES, args.max_layers)
 
     elif args.mode == 'infer':
@@ -520,7 +520,7 @@ def main():
 
         list_of_predicted_layer_masks_np = infer_single_image(
             model, args.input_image, device, target_size_tuple, args.use_tif,
-            num_classes=NUM_SHAPE_CLASSES, max_layers=args.max_layers
+            num_shape_classes=NUM_SHAPE_CLASSES, max_layers=args.max_layers
         )
 
         if list_of_predicted_layer_masks_np:
@@ -528,7 +528,8 @@ def main():
             output_dir_path = Path(args.output_dir)
             output_dir_path.mkdir(parents=True, exist_ok=True)
 
-            from src.core.utils import create_color_visualization, get_distinct_colors # For vis
+            #from src.core.utils import create_color_visualization, get_distinct_colors # For vis
+            from utils import create_color_visualization, get_distinct_colors
 
             # --- Save individual predicted layer masks and their visualizations ---
             layer_vis_colors = get_distinct_colors(NUM_SHAPE_CLASSES) # Colors for shape types
