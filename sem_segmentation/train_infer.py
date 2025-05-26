@@ -503,7 +503,7 @@ def main():
                 logger.info(f"Floading model weights from: {args.model_path} for continued training.")
                 model.load_state_dict(torch.load(args.model_path, map_location=device))
             except Exception as e:
-                logger.error(f"Could no  load weights from {args.model_path}: {e}. Starting from scratch")
+                logger.error(f"Could no  load weights from {args.model_path}: {e}. Starting from scratch.")
         criterion = nn.CrossEntropyLoss() # Ignores background by default if target has it and not in output channel for background
         optimizer = optim.Adam(model.parameters(), lr=args.lr)
         scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.2, patience=3, threshold=0.001, threshold_mode='abs', min_lr=1e-8) # Reduce LR if val_dice doesn't improve for 5 epochs
@@ -536,7 +536,6 @@ def main():
 
             #from src.core.utils import create_color_visualization, get_distinct_colors # For vis
             from utils import create_color_visualization, get_distinct_colors
-
             # --- Save individual predicted layer masks and their visualizations ---
             layer_vis_colors = get_distinct_colors(NUM_SHAPE_CLASSES) # Colors for shape types
             shape_type_colormap = {i: layer_vis_colors[i % len(layer_vis_colors)] for i in range(NUM_SHAPE_CLASSES)}
